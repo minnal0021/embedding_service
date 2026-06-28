@@ -3,6 +3,7 @@ import os
 import numpy as np
 from fastembed import TextEmbedding
 from fastembed.common.model_description import ModelSource, PoolingType
+from huggingface_hub import hf_hub_download
 
 
 class EmbeddingService:
@@ -45,6 +46,7 @@ class EmbeddingService:
         onnx_file = onnx_file or os.getenv("FASTEMBED_ONNX_FILE", "onnx/model.onnx")
 
         self._register(self.model_name, onnx_file)
+        self._ensure_files(onnx_file)
 
         print(f"Loading {self.model_name} from {self.cache_dir}...")
         self.encoder = TextEmbedding(
@@ -67,6 +69,22 @@ class EmbeddingService:
             additional_files=[onnx_file + "_data"],
         )
         cls._registered = True
+
+    def _ensure_files(self, onnx_file: str) -> None:
+        """Make sure the ONNX graph + its external-data file are downloaded.
+
+        FastEmbed caches by snapshot-directory existence, so if the directory
+        was created for a *different* ONNX build (e.g. the quantised one) it
+        will not fetch a newly-requested file and the load fails with
+        NO_SUCHFILE. `hf_hub_download` is idempotent and fetches only what is
+        missing, so this guarantees the requested build is present.
+        """
+        for filename in (onnx_file, onnx_file + "_data"):
+            hf_hub_download(
+                repo_id=self.ONNX_SOURCE,
+                filename=filename,
+                cache_dir=self.cache_dir,
+            )
 
     def embed_documents(
         self, payloads: list[str], dimensions: int | None = None
