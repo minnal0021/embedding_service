@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local FastEmbed model cache (downloaded at runtime)
+fastembed_cache/
+
+# Background service runtime files
+embedding_service.pid
+embedding_service.log
+
+# Generated sample embeddings (parquet output)
+embedding/
