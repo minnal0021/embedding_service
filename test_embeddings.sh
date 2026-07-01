@@ -12,7 +12,7 @@ set -euo pipefail
 #   SERVICE_URL   Embedding service base URL  (default: http://localhost:8000)
 #   DIMENSIONS    Embedding dimensions        (default: 768)
 
-SERVICE_URL="${1:-${SERVICE_URL:-http://localhost:8000}}"
+SERVICE_URL="${1:-${SERVICE_URL:-http://localhost:8001}}"
 DIMENSIONS="${DIMENSIONS:-768}"
 
 echo "════════════════════════════════════════════════════════════════"
