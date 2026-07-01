@@ -9,7 +9,7 @@ Syncs dependencies, then starts the EmbeddingGemma-300M FastAPI service
 (FastEmbed + uvicorn) in the background and waits for it to become healthy.
 
 Options:
-  --host HOST        Bind address              (default: 127.0.0.1)
+  --host HOST        Bind address              (default: 0.0.0.0)
   --port PORT        Bind port                 (default: 8000)
   --onnx-file FILE   ONNX build to load        (default: onnx/model.onnx)
                      e.g. onnx/model_quantized.onnx for a smaller/faster build
@@ -25,8 +25,8 @@ EOF
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Defaults (env-overridable) ────────────────────────────────────────────────
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8001}"
 ONNX_FILE="${FASTEMBED_ONNX_FILE:-onnx/model.onnx}"
 CACHE_DIR="${FASTEMBED_CACHE_PATH:-${ROOT_DIR}/fastembed_cache}"
 FOREGROUND=0
