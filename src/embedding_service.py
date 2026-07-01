@@ -24,6 +24,15 @@ class EmbeddingService:
     # Native (untruncated) embedding width of the model.
     FULL_DIMENSION = 768
 
+    # Tokenizer/config files FastEmbed's loader requires in the snapshot dir
+    # alongside the ONNX graph (see fastembed.common.preprocessor_utils).
+    TOKENIZER_FILES = (
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    )
+
     # EmbeddingGemma's documented task prompts (from the model card).
     QUERY_PROMPT = "task: search result | query: "
     DOCUMENT_PROMPT = "title: none | text: "
@@ -71,15 +80,17 @@ class EmbeddingService:
         cls._registered = True
 
     def _ensure_files(self, onnx_file: str) -> None:
-        """Make sure the ONNX graph + its external-data file are downloaded.
+        """Make sure the ONNX graph, its external-data file, and the tokenizer/
+        config files are all present in the snapshot.
 
-        FastEmbed caches by snapshot-directory existence, so if the directory
-        was created for a *different* ONNX build (e.g. the quantised one) it
-        will not fetch a newly-requested file and the load fails with
-        NO_SUCHFILE. `hf_hub_download` is idempotent and fetches only what is
-        missing, so this guarantees the requested build is present.
+        FastEmbed caches by snapshot-directory existence: once the snapshot dir
+        exists it loads with `local_files_only=True` and never fetches anything
+        else, so a partially-populated snapshot fails at load time (e.g. with a
+        missing ONNX build, or "Could not find config.json"). `hf_hub_download`
+        is idempotent and fetches only what is missing, so pre-fetching every
+        required file here guarantees the snapshot is complete before load.
         """
-        for filename in (onnx_file, onnx_file + "_data"):
+        for filename in (onnx_file, onnx_file + "_data", *self.TOKENIZER_FILES):
             hf_hub_download(
                 repo_id=self.ONNX_SOURCE,
                 filename=filename,
