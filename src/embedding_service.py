@@ -48,6 +48,15 @@ class EmbeddingService:
     DEVICES = ("auto", "gpu", "cpu")
     AMD_PCI_VENDOR = "0x1002"
 
+    # Texts per ONNX run. The amdgpu driver resets any GPU job that runs past
+    # its ring timeout (~10s), which kills the WebGPU device for the rest of
+    # the process; large batches of long texts can hit that, so GPU runs use
+    # small batches. Override with EMBEDDING_BATCH_SIZE.
+    GPU_BATCH_SIZE = 8
+    CPU_BATCH_SIZE = 64
+    # Substring onnxruntime's WebGPU provider reports once the device is gone.
+    DEVICE_LOST_MARKER = "is lost"
+
     _registered = False
 
     def __init__(
@@ -73,6 +82,13 @@ class EmbeddingService:
         if device not in self.DEVICES:
             raise ValueError(f"device must be one of {self.DEVICES}, got {device!r}")
 
+        self.requested_device = device
+        self._batch_size_override = os.getenv("EMBEDDING_BATCH_SIZE")
+        self._init_encoder()
+
+    def _init_encoder(self) -> None:
+        """(Re)create the ONNX session on the requested device."""
+        device = self.requested_device
         use_gpu = device == "gpu" or (device == "auto" and self._amd_gpu_present())
         print(f"Loading {self.model_name} from {self.cache_dir}...")
         if use_gpu:
@@ -91,7 +107,15 @@ class EmbeddingService:
         self.device = "gpu" if self.GPU_PROVIDER in providers else "cpu"
         if device == "gpu" and self.device != "gpu":
             raise RuntimeError(f"GPU requested but session providers are {providers}")
-        print(f"Embedding device: {self.device} ({', '.join(providers)})")
+        if self._batch_size_override:
+            self.batch_size = int(self._batch_size_override)
+        else:
+            gpu = self.device == "gpu"
+            self.batch_size = self.GPU_BATCH_SIZE if gpu else self.CPU_BATCH_SIZE
+        print(
+            f"Embedding device: {self.device} ({', '.join(providers)}), "
+            f"batch size {self.batch_size}"
+        )
 
     def _load(self, providers: list[str]) -> TextEmbedding:
         return TextEmbedding(
@@ -150,14 +174,33 @@ class EmbeddingService:
     ) -> list[list[float]]:
         """Embed payloads as documents (for indexing)."""
         prompted = [self.DOCUMENT_PROMPT + p for p in payloads]
-        return self._embed(self.encoder.embed(prompted), dimensions)
+        return self._run(prompted, dimensions)
 
     def embed_query(
         self, payloads: list[str], dimensions: int | None = None
     ) -> list[list[float]]:
         """Embed payloads as search queries."""
         prompted = [self.QUERY_PROMPT + p for p in payloads]
-        return self._embed(self.encoder.embed(prompted), dimensions)
+        return self._run(prompted, dimensions)
+
+    def _run(self, texts: list[str], dimensions: int | None) -> list[list[float]]:
+        """Embed `texts`, rebuilding the session once if the GPU device was lost.
+
+        A lost WebGPU device (e.g. after a driver ring reset) never comes back
+        within the same session, so without this every later request fails.
+        """
+        try:
+            return self._embed(
+                self.encoder.embed(texts, batch_size=self.batch_size), dimensions
+            )
+        except Exception as e:
+            if self.DEVICE_LOST_MARKER not in str(e):
+                raise
+            print(f"WARNING: GPU device lost ({e}); reloading the model.")
+            self._init_encoder()
+            return self._embed(
+                self.encoder.embed(texts, batch_size=self.batch_size), dimensions
+            )
 
     def _embed(self, vectors, dimensions: int | None) -> list[list[float]]:
         """Truncate (Matryoshka) + L2-normalise FastEmbed's vectors to lists.

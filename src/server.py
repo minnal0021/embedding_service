@@ -9,10 +9,14 @@ Routes match the Rust client contract exactly:
 One embedding is returned per payload; the model is fixed server-side.
 """
 
+import logging
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from embedding_service import EmbeddingService
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="EmbeddingGemma-300M API")
 
@@ -53,6 +57,7 @@ def _embed(embed_fn, request: BatchEmbedRequest) -> BatchEmbedResponse:
     try:
         embeddings = embed_fn(request.payloads, request.dimensions)
     except Exception as e:  # noqa: BLE001 — surface model errors as 500s
+        logger.exception("Embedding %d payloads failed", len(request.payloads))
         raise HTTPException(status_code=500, detail=str(e))
     return BatchEmbedResponse(embeddings=embeddings)
 
