@@ -14,11 +14,13 @@ Options:
   --onnx-file FILE   ONNX build to load        (default: onnx/model.onnx)
                      e.g. onnx/model_quantized.onnx for a smaller/faster build
   --cache-dir DIR    FastEmbed model cache     (default: ./fastembed_cache)
+  --device DEVICE    auto | gpu | cpu          (default: auto)
+                     auto uses an AMD GPU when one is found, else the CPU
   -f, --foreground   Run in the foreground (Ctrl-C to stop) instead of detaching
   -h, --help         Show this help message
 
 Environment overrides (used as defaults if the matching flag is omitted):
-  HOST, PORT, FASTEMBED_ONNX_FILE, FASTEMBED_CACHE_PATH
+  HOST, PORT, FASTEMBED_ONNX_FILE, FASTEMBED_CACHE_PATH, EMBEDDING_DEVICE
 EOF
 }
 
@@ -29,6 +31,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
 ONNX_FILE="${FASTEMBED_ONNX_FILE:-onnx/model.onnx}"
 CACHE_DIR="${FASTEMBED_CACHE_PATH:-${ROOT_DIR}/fastembed_cache}"
+DEVICE="${EMBEDDING_DEVICE:-auto}"
 FOREGROUND=0
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -38,6 +41,7 @@ while (( "$#" )); do
     --port)       PORT="$2"; shift 2 ;;
     --onnx-file)  ONNX_FILE="$2"; shift 2 ;;
     --cache-dir)  CACHE_DIR="$2"; shift 2 ;;
+    --device)     DEVICE="$2"; shift 2 ;;
     -f|--foreground) FOREGROUND=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)
@@ -54,6 +58,7 @@ LOG_FILE="${ROOT_DIR}/embedding_service.log"
 
 export FASTEMBED_CACHE_PATH="${CACHE_DIR}"
 export FASTEMBED_ONNX_FILE="${ONNX_FILE}"
+export EMBEDDING_DEVICE="${DEVICE}"
 
 # ── Preflight: uv + dependencies ──────────────────────────────────────────────
 echo "Checking uv ..."
@@ -83,6 +88,7 @@ echo ""
 echo "Starting embedding service ..."
 echo "  ONNX build : ${ONNX_FILE}"
 echo "  Cache dir  : ${CACHE_DIR}"
+echo "  Device     : ${DEVICE}"
 echo "  URL        : ${SERVICE_URL}"
 
 # ── Foreground mode: hand the terminal to uvicorn ─────────────────────────────
@@ -130,6 +136,7 @@ echo "  Query endpoint   : ${SERVICE_URL}/embedding/query"
 echo "  Document endpoint: ${SERVICE_URL}/embedding/document"
 echo "  Health endpoint  : ${SERVICE_URL}/healthcheck"
 echo "  Model            : google/embeddinggemma-300m (${ONNX_FILE})"
+echo "  Device           : $(curl -fsS "${SERVICE_URL}/healthcheck" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("device","?"))')"
 echo "  Logs             : ${LOG_FILE}"
 echo "  Stop             : kill \$(cat '${PID_FILE}')"
 echo "════════════════════════════════════════════════════════════════"

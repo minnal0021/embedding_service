@@ -21,6 +21,7 @@ per payload.
 - [Offline pipeline: sample embeddings → centroids](#offline-pipeline-sample-embeddings--centroids)
 - [Scripts](#scripts)
 - [Configuration](#configuration)
+- [GPU acceleration (AMD)](#gpu-acceleration-amd)
 - [How EmbeddingGemma is loaded](#how-embeddinggemma-is-loaded)
 - [Sample data & Git LFS](#sample-data--git-lfs)
 - [Project layout](#project-layout)
@@ -42,7 +43,7 @@ per payload.
                      │  (embedding_service.py)
                      └─────────┬──────────┘
                                │
-                        ONNX (onnxruntime)
+              ONNX (onnxruntime-webgpu: AMD GPU via Vulkan, else CPU)
 
   Offline pipeline (no server required):
 
@@ -134,7 +135,7 @@ list returns `{"embeddings": []}` without invoking the model.
 ### `GET /healthcheck`
 
 ```json
-{ "status": "healthy", "model": "google/embeddinggemma-300m" }
+{ "status": "healthy", "model": "google/embeddinggemma-300m", "device": "gpu" }
 ```
 
 **Example**
@@ -236,7 +237,7 @@ defaults to 256 and is capped to the number of available embeddings.
 | [`generate_cluster_centroids.sh`](generate_cluster_centroids.sh) | Run the cluster centroid generator with project defaults. |
 
 `start_embedding_service.sh` options: `--host`, `--port`, `--onnx-file`,
-`--cache-dir`, `-f/--foreground`. Run any script with `-h` for details.
+`--cache-dir`, `--device`, `-f/--foreground`. Run any script with `-h` for details.
 
 ---
 
@@ -248,10 +249,35 @@ Environment variables (read by the service and start script):
 | --- | --- | --- |
 | `FASTEMBED_CACHE_PATH` | `/app/fastembed_cache` (`./fastembed_cache` via the start script) | Where the model is cached. |
 | `FASTEMBED_ONNX_FILE` | `onnx/model.onnx` | ONNX build to load. Use `onnx/model_quantized.onnx` for a smaller/faster download. |
+| `EMBEDDING_DEVICE` | `auto` | `auto` uses an AMD GPU when one is found, else the CPU. `gpu` requires the GPU (startup fails without it); `cpu` forces the CPU. |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address for the start script. |
 
 Available ONNX builds in the upstream repo include `onnx/model.onnx`
 (full precision), `onnx/model_fp16.onnx`, and `onnx/model_quantized.onnx`.
+
+---
+
+## GPU acceleration (AMD)
+
+The service uses the `onnxruntime-webgpu` build of onnxruntime instead of the
+CPU-only `onnxruntime` package (see the `override-dependencies` entry in
+`pyproject.toml`). Its WebGPU execution provider runs on the GPU through Vulkan,
+so AMD GPUs work through the Mesa RADV driver. You don't need ROCm or MIGraphX.
+
+With `EMBEDDING_DEVICE=auto` (the default), the service checks for an AMD GPU
+(PCI vendor `0x1002` under `/sys/class/drm`) at startup. If it finds one, it
+loads the model on the GPU. If there is no GPU, or the GPU session fails to
+load, it logs a warning and uses the CPU. The device in use is logged at
+startup and returned by `/healthcheck`.
+
+Requirements: a Vulkan driver for the GPU (Mesa `mesa-vulkan-drivers` on
+Ubuntu), and read/write access to `/dev/dri/renderD*` (the `render` group, or
+a logged-in desktop session).
+
+On a Radeon AI PRO R9700, the GPU embeds about 2.5× faster than the CPU
+(Ryzen 9 9950X3D) on the ELI5 sample data. GPU and CPU embeddings agree to a
+cosine similarity of ≥ 0.998. RADV may print `radv is not a conformant Vulkan
+implementation` for newer GPUs. You can ignore it.
 
 ---
 

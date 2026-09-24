@@ -4,6 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "fastembed",
+    # GPU-capable onnxruntime build: runs on AMD (and other) GPUs through
+    # Vulkan via the WebGPU execution provider, with a CPU fallback.
+    "onnxruntime-webgpu",
     "fastapi",
     "uvicorn",
     "numpy",
@@ -12,3 +15,8 @@ dependencies = [
     "tqdm",
     "scikit-learn",
 ]
+
+[tool.uv]
+# fastembed depends on the CPU-only `onnxruntime`, which installs the same
+# `onnxruntime` module as `onnxruntime-webgpu` and would clobber it. Drop it.
+override-dependencies = ["onnxruntime; sys_platform == 'never'"]
