@@ -16,7 +16,7 @@ from embedding_service import EmbeddingService
 
 app = FastAPI(title="EmbeddingGemma-300M API")
 
-# Loaded once at import; embedding is CPU-bound but FastEmbed is internally batched.
+# Loaded once at import; runs on the GPU when one is found (see EmbeddingService).
 service = EmbeddingService()
 
 
@@ -42,7 +42,7 @@ async def embed_query(request: BatchEmbedRequest) -> BatchEmbedResponse:
 
 @app.get("/healthcheck")
 async def healthcheck() -> dict[str, str]:
-    return {"status": "healthy", "model": service.model_name}
+    return {"status": "healthy", "model": service.model_name, "device": service.device}
 
 
 def _embed(embed_fn, request: BatchEmbedRequest) -> BatchEmbedResponse:

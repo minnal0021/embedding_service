@@ -1,3 +1,4 @@
+import glob
 import os
 
 import numpy as np
@@ -16,6 +17,11 @@ class EmbeddingService:
     `query_embed`/`passage_embed` for a custom model), so we apply those prompts
     ourselves. EmbeddingGemma supports Matryoshka representation, so callers may
     request a truncated `dimensions`; vectors are sliced and re-normalised.
+
+    Inference runs on an AMD GPU automatically when one is present, via
+    onnxruntime's WebGPU execution provider (Vulkan under the hood, so no ROCm
+    install is needed); otherwise it runs on the CPU. `device` (or the
+    EMBEDDING_DEVICE env var) overrides this: "auto" (default), "gpu", "cpu".
     """
 
     DEFAULT_MODEL_NAME = "google/embeddinggemma-300m"
@@ -37,6 +43,11 @@ class EmbeddingService:
     QUERY_PROMPT = "task: search result | query: "
     DOCUMENT_PROMPT = "title: none | text: "
 
+    GPU_PROVIDER = "WebGpuExecutionProvider"
+    CPU_PROVIDER = "CPUExecutionProvider"
+    DEVICES = ("auto", "gpu", "cpu")
+    AMD_PCI_VENDOR = "0x1002"
+
     _registered = False
 
     def __init__(
@@ -44,6 +55,7 @@ class EmbeddingService:
         model_name: str | None = None,
         cache_dir: str | None = None,
         onnx_file: str | None = None,
+        device: str | None = None,
     ):
         self.model_name = model_name or self.DEFAULT_MODEL_NAME
         # Pull custom cache path or fall back to the local cached folder.
@@ -57,10 +69,46 @@ class EmbeddingService:
         self._register(self.model_name, onnx_file)
         self._ensure_files(onnx_file)
 
+        device = (device or os.getenv("EMBEDDING_DEVICE", "auto")).lower()
+        if device not in self.DEVICES:
+            raise ValueError(f"device must be one of {self.DEVICES}, got {device!r}")
+
+        use_gpu = device == "gpu" or (device == "auto" and self._amd_gpu_present())
         print(f"Loading {self.model_name} from {self.cache_dir}...")
-        self.encoder = TextEmbedding(
-            model_name=self.model_name, cache_dir=self.cache_dir
+        if use_gpu:
+            try:
+                self.encoder = self._load([self.GPU_PROVIDER, self.CPU_PROVIDER])
+            except Exception as e:
+                if device == "gpu":
+                    raise
+                print(f"WARNING: GPU load failed ({e}); falling back to CPU.")
+                use_gpu = False
+        if not use_gpu:
+            self.encoder = self._load([self.CPU_PROVIDER])
+
+        # The providers the ONNX session actually ended up with.
+        providers = self.encoder.model.model.get_providers()
+        self.device = "gpu" if self.GPU_PROVIDER in providers else "cpu"
+        if device == "gpu" and self.device != "gpu":
+            raise RuntimeError(f"GPU requested but session providers are {providers}")
+        print(f"Embedding device: {self.device} ({', '.join(providers)})")
+
+    def _load(self, providers: list[str]) -> TextEmbedding:
+        return TextEmbedding(
+            model_name=self.model_name, cache_dir=self.cache_dir, providers=providers
         )
+
+    @classmethod
+    def _amd_gpu_present(cls) -> bool:
+        """True if the kernel exposes an AMD GPU (PCI vendor 0x1002) via DRM."""
+        for vendor_file in glob.glob("/sys/class/drm/card*/device/vendor"):
+            try:
+                with open(vendor_file) as f:
+                    if f.read().strip() == cls.AMD_PCI_VENDOR:
+                        return True
+            except OSError:
+                continue
+        return False
 
     @classmethod
     def _register(cls, model_name: str, onnx_file: str) -> None:
