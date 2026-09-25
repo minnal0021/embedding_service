@@ -217,7 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local FastEmbed model cache (downloaded at runtime)
+# Local model caches (downloaded at runtime; fastembed_cache/ is from the old ONNX runtime)
+model_cache/
 fastembed_cache/
 
 # Background service runtime files
