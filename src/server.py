@@ -16,8 +16,9 @@ document (~5 texts), so this is what fills the GPU. The model call runs in a
 worker thread, keeping the event loop — and `/healthcheck` — responsive.
 
 Knobs (env): EMBEDDING_MAX_BATCH_TEXTS (default 256) caps the texts per model
-call; EMBEDDING_BATCH_WAIT_MS (default 2) is how long an idle worker waits for
-more requests after the first arrives.
+call; EMBEDDING_BATCH_WAIT_MS (default 2) is how long a busy worker waits for
+more requests after taking the backlog. An idle worker runs the first request
+immediately, so a lone request never pays the wait.
 """
 
 import asyncio
@@ -64,11 +65,14 @@ class DynamicBatcher:
         """Worker loop: take the first job, gather more, run one model call."""
         loop = asyncio.get_running_loop()
         while True:
+            # An empty queue here means the worker is idle: run the next
+            # request immediately rather than adding the wait to its latency.
+            idle = self.queue.empty()
             jobs = [await self.queue.get()]
             count = len(jobs[0].texts)
-            # Requests that queued while the previous batch ran are taken at
-            # once; when idle, wait briefly so near-simultaneous requests share.
-            deadline = loop.time() + self.max_wait_s
+            # Under load, take the backlog that queued while the previous batch
+            # ran, then wait briefly so more near-simultaneous requests share.
+            deadline = loop.time() + (0 if idle else self.max_wait_s)
             while count < self.max_texts:
                 try:
                     job = self.queue.get_nowait()
