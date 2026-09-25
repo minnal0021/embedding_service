@@ -12,7 +12,7 @@ For each record it generates one document embedding from the combined
 question and answer, to a Parquet file. The resulting vectors are intended as
 sample data for downstream centroid creation.
 
-Embeddings come from the in-process :class:`EmbeddingService` (FastEmbed +
+Embeddings come from the in-process :class:`EmbeddingService` (PyTorch +
 EmbeddingGemma-300M), so no running HTTP service is required. The service
 applies EmbeddingGemma's document prompt, Matryoshka truncation to the
 requested ``--dimensions``, and L2-normalisation internally.
@@ -163,7 +163,6 @@ class SampleEmbeddingGenerator:
         max_records: int = DEFAULT_MAX_RECORDS,
         model_name: str | None = None,
         cache_dir: str | None = None,
-        onnx_file: str | None = None,
     ):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
@@ -172,7 +171,7 @@ class SampleEmbeddingGenerator:
         self.batch_size = batch_size
         self.max_records = max_records
         self.service = EmbeddingService(
-            model_name=model_name, cache_dir=cache_dir, onnx_file=onnx_file
+            model_name=model_name, cache_dir=cache_dir
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────

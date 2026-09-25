@@ -1,7 +1,8 @@
 # Embedding Service
 
-A text embedding service built on [FastEmbed](https://github.com/qdrant/fastembed)
-and Google's [EmbeddingGemma-300M](https://huggingface.co/google/embeddinggemma-300m),
+A text embedding service built on [PyTorch](https://pytorch.org/) (ROCm build) with
+[sentence-transformers](https://www.sbert.net/) and Google's
+[EmbeddingGemma-300M](https://huggingface.co/google/embeddinggemma-300m),
 plus an offline data-preparation pipeline that generates sample embeddings and
 K-means cluster centroids.
 
@@ -23,6 +24,7 @@ per payload.
 - [Configuration](#configuration)
 - [GPU acceleration (AMD)](#gpu-acceleration-amd)
 - [How EmbeddingGemma is loaded](#how-embeddinggemma-is-loaded)
+- [Migrating from the ONNX runtime](#migrating-from-the-onnx-runtime)
 - [Sample data & Git LFS](#sample-data--git-lfs)
 - [Project layout](#project-layout)
 
@@ -39,11 +41,11 @@ per payload.
                 └──────────────┬──────────────┘
                                │
                      ┌─────────▼──────────┐
-                     │  EmbeddingService  │  FastEmbed + EmbeddingGemma-300M
+                     │  EmbeddingService  │  sentence-transformers + EmbeddingGemma-300M
                      │  (embedding_service.py)
                      └─────────┬──────────┘
                                │
-              ONNX (onnxruntime-webgpu: AMD GPU via Vulkan, else CPU)
+              PyTorch (ROCm/HIP: AMD GPU in bfloat16, else CPU in float32)
 
   Offline pipeline (no server required):
 
@@ -64,7 +66,10 @@ width and re-normalised. All returned vectors are **L2-normalised**.
 
 - Python **≥ 3.14**
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
-- Network access on first run (the model is downloaded from Hugging Face)
+- Network access on first run (the ~1.2 GB model is downloaded from Hugging Face;
+  the ROCm PyTorch wheel makes the `uv sync` download several GB)
+- Linux x86_64 with an AMD GPU for GPU inference (see
+  [GPU acceleration](#gpu-acceleration-amd)); anything else runs on the CPU
 - [Git LFS](https://git-lfs.com/) to check out the sample data
 
 Install dependencies:
@@ -150,8 +155,8 @@ curl -X POST http://localhost:8000/embedding/query \
 
 ## The `EmbeddingService` class
 
-[`src/embedding_service.py`](src/embedding_service.py) wraps FastEmbed and can be
-used directly (in-process), without the HTTP server:
+[`src/embedding_service.py`](src/embedding_service.py) wraps sentence-transformers
+and can be used directly (in-process), without the HTTP server:
 
 ```python
 from embedding_service import EmbeddingService
@@ -236,8 +241,9 @@ defaults to 256 and is capped to the number of available embeddings.
 | [`test_embeddings.sh`](test_embeddings.sh) | Test suite: health, batch query/document embedding, dimension truncation. |
 | [`generate_cluster_centroids.sh`](generate_cluster_centroids.sh) | Run the cluster centroid generator with project defaults. |
 
-`start_embedding_service.sh` options: `--host`, `--port`, `--onnx-file`,
-`--cache-dir`, `--device`, `-f/--foreground`. Run any script with `-h` for details.
+`start_embedding_service.sh` options: `--host`, `--port`, `--model`,
+`--cache-dir`, `--device`, `--dtype`, `-f/--foreground`. Run any script with `-h`
+for details.
 
 ---
 
@@ -247,52 +253,112 @@ Environment variables (read by the service and start script):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `FASTEMBED_CACHE_PATH` | `/app/fastembed_cache` (`./fastembed_cache` via the start script) | Where the model is cached. |
-| `FASTEMBED_ONNX_FILE` | `onnx/model.onnx` | ONNX build to load. Use `onnx/model_quantized.onnx` for a smaller/faster download. |
-| `EMBEDDING_DEVICE` | `auto` | `auto` uses an AMD GPU when one is found, else the CPU. `gpu` requires the GPU (startup fails without it); `cpu` forces the CPU. |
-| `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address for the start script. |
-
-Available ONNX builds in the upstream repo include `onnx/model.onnx`
-(full precision), `onnx/model_fp16.onnx`, and `onnx/model_quantized.onnx`.
+| `EMBEDDING_MODEL` | `unsloth/embeddinggemma-300m` | Hugging Face repo to load. The default is an ungated mirror of `google/embeddinggemma-300m`. The official repo is gated: accept the Gemma licence on huggingface.co, set `HF_TOKEN` (or run `hf auth login`), then set this to `google/embeddinggemma-300m`. |
+| `EMBEDDING_CACHE_PATH` | `/app/model_cache` (`./model_cache` via the start script) | Where the model is cached. |
+| `EMBEDDING_DEVICE` | `auto` | `auto` uses a supported AMD GPU when PyTorch finds one, else the CPU. `gpu` requires the GPU (startup fails without it); `cpu` forces the CPU. |
+| `EMBEDDING_DTYPE` | `bfloat16` on GPU, `float32` on CPU | Inference precision. `float16` is not offered: EmbeddingGemma's activations overflow in fp16. |
+| `EMBEDDING_GPU_INDEX` | *(auto)* | Pin a GPU by PyTorch index instead of auto-selecting. |
+| `EMBEDDING_BATCH_SIZE` | `32` on GPU, `16` on CPU | Texts per forward pass. |
+| `EMBEDDING_MAX_SEQ_LENGTH` | `2048` (model native) | Truncate inputs to this many tokens. |
+| `EMBEDDING_MAX_BATCH_TEXTS` | `256` | Server: cap on texts gathered from concurrent requests into one model call. |
+| `EMBEDDING_BATCH_WAIT_MS` | `2` | Server: how long an idle batch worker waits for more requests after the first arrives. |
+| `HOST` / `PORT` | `0.0.0.0` / `8001` | Bind address for the start script. |
 
 ---
 
 ## GPU acceleration (AMD)
 
-The service uses the `onnxruntime-webgpu` build of onnxruntime instead of the
-CPU-only `onnxruntime` package (see the `override-dependencies` entry in
-`pyproject.toml`). Its WebGPU execution provider runs on the GPU through Vulkan,
-so AMD GPUs work through the Mesa RADV driver. You don't need ROCm or MIGraphX.
+The service runs on PyTorch's **ROCm** build (`torch==…+rocm7.1`, pulled from
+PyTorch's ROCm wheel index; see `[tool.uv.sources]` in `pyproject.toml`). Inference
+runs natively on the GPU through HIP, using the matrix cores in **bfloat16**.
+The wheel bundles its own ROCm libraries. The host needs only:
 
-With `EMBEDDING_DEVICE=auto` (the default), the service checks for an AMD GPU
-(PCI vendor `0x1002` under `/sys/class/drm`) at startup. If it finds one, it
-loads the model on the GPU. If there is no GPU, or the GPU session fails to
-load, it logs a warning and uses the CPU. The device in use is logged at
-startup and returned by `/healthcheck`.
+- the in-kernel `amdgpu` driver (stock on recent Ubuntu kernels);
+- read/write access to `/dev/kfd` and `/dev/dri/renderD*` (the `render` group,
+  or the ACL a logged-in desktop session grants);
+- a GPU architecture the wheel ships kernels for. The ROCm 7.1 wheel covers
+  gfx900–gfx950, including RDNA3 (gfx110x) and RDNA4 (gfx1200/gfx1201, e.g.
+  Radeon AI PRO R9700).
 
-Requirements: a Vulkan driver for the GPU (Mesa `mesa-vulkan-drivers` on
-Ubuntu), and read/write access to `/dev/dri/renderD*` (the `render` group, or
-a logged-in desktop session).
+With `EMBEDDING_DEVICE=auto` (the default), the service picks among the GPUs
+PyTorch can see. It skips any whose architecture the wheel has no kernels for
+(e.g. an integrated Radeon next to a discrete card) and takes the one with the
+most compute units. If there is none, it uses the CPU. The chosen device,
+dtype, and batch size are logged at startup, and `/healthcheck` returns the
+device. The ROCm index only has Linux x86_64 wheels; other platforms install
+the regular PyPI `torch` and run on the CPU (or pin a GPU build yourself).
 
-On a Radeon AI PRO R9700, the GPU embeds about 2.5× faster than the CPU
-(Ryzen 9 9950X3D) on the ELI5 sample data. GPU and CPU embeddings agree to a
-cosine similarity of ≥ 0.998. RADV may print `radv is not a conformant Vulkan
-implementation` for newer GPUs. You can ignore it.
+### Cross-request batching
+
+Clients such as minnal send one small request per document (the whole text plus
+~4 chunks, about 5 texts). Each model call has a fixed cost of about 15 ms, and
+larger calls pad less because texts are length-sorted within a call. So the
+server batches **across** requests: every request goes onto a queue, and a
+single worker runs one model call for everything queued (document and query
+texts together, each already carrying its task prompt). It then splits the
+vectors back and applies each request's own `dimensions`. If a shared call
+fails, each request is retried alone, so one bad request cannot fail its
+neighbours. The model call runs in a worker thread, so `/healthcheck` stays
+responsive under load (p50 < 1 ms).
+
+### Throughput
+
+Measured on a Radeon AI PRO R9700 with SciFact abstracts, one document per
+request (whole text + 4-sentence chunks):
+
+| Runtime | Requests in flight | docs/s |
+| --- | ---: | ---: |
+| Previous: FastEmbed + onnxruntime-webgpu (WebGPU over Vulkan/RADV), fp32 | 8 | ~4 |
+| PyTorch ROCm, bfloat16 | 1 | ~30 |
+| PyTorch ROCm, bfloat16 | 8 | ~36 |
+| PyTorch ROCm, bfloat16 | 16 | ~43 |
+| PyTorch ROCm, bfloat16 | 64 | **~58** |
+| *Model only, in-process, 64 docs per call (ceiling)* | — | *~67* |
+
+Throughput tracks the batch size the server can form, so **keep many requests
+in flight** (32–64) to get the most from the GPU. bfloat16 and float32
+embeddings agree to a cosine similarity of ≥ 0.9999, and a request batched with
+others gets the same vectors as when sent alone (cosine ≥ 0.9998, bfloat16
+rounding).
 
 ---
 
 ## How EmbeddingGemma is loaded
 
-EmbeddingGemma is **not** in FastEmbed's built-in registry, so `EmbeddingService`
-registers it as a custom ONNX model on first use, pulling
-[`onnx-community/embeddinggemma-300m-ONNX`](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX)
-from Hugging Face (MEAN pooling, normalisation enabled, native dim 768).
+`EmbeddingService` loads the model with sentence-transformers, which applies
+EmbeddingGemma's full published pipeline:
 
-Because it is a custom model, FastEmbed does not auto-apply EmbeddingGemma's task
-prompts — the service applies them itself:
+```
+transformer → mean pooling → Dense 768→3072 → Dense 3072→768 → L2 normalise
+```
+
+EmbeddingGemma embeds queries and documents asymmetrically. The service applies
+the task prompts itself:
 
 - Documents: `title: none | text: <payload>`
 - Queries: `task: search result | query: <payload>`
+
+---
+
+## Migrating from the ONNX runtime
+
+The previous runtime registered `onnx-community/embeddinggemma-300m-ONNX` with
+FastEmbed as a custom model with MEAN pooling. That mean-pooled the transformer's
+raw hidden states and **skipped both Dense projections**, so its vectors were not
+EmbeddingGemma's trained embeddings. They match the new service's
+transformer + pooling stage (cosine ≈ 0.9996) but are unrelated to its final
+output (cosine ≈ 0.0).
+
+**Existing vectors and centroids are incompatible with this service.** Anything
+built on the old embeddings must be regenerated with the new service:
+
+1. Sample embeddings: `./generate_sample_embeddings.sh`.
+2. Cluster centroids: `./generate_cluster_centroids.sh`, then install the new
+   `clusters.json` wherever the consumer (e.g. minnal) loads its centroids.
+3. Re-index every stored vector in the consumer, and clear any query-embedding
+   caches.
+
+The old `fastembed_cache/` directory is no longer used and can be deleted.
 
 ---
 
@@ -306,7 +372,7 @@ git lfs install
 git lfs pull
 ```
 
-The model cache (`fastembed_cache/`), generated embeddings (`embedding/`), and
+The model cache (`model_cache/`), generated embeddings (`embedding/`), and
 service runtime files (`embedding_service.pid`, `embedding_service.log`) are
 gitignored.
 
@@ -317,7 +383,7 @@ gitignored.
 ```
 .
 ├── src/
-│   ├── embedding_service.py          # EmbeddingService (FastEmbed wrapper)
+│   ├── embedding_service.py          # EmbeddingService (PyTorch / sentence-transformers)
 │   ├── server.py                     # FastAPI HTTP server
 │   ├── sample_embedding_generator.py # ELI5 QA → Parquet embeddings
 │   └── cluster_centroid_generator.py # Parquet → K-means centroids (JSONL)
