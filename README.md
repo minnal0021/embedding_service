@@ -261,7 +261,7 @@ Environment variables (read by the service and start script):
 | `EMBEDDING_BATCH_SIZE` | `32` on GPU, `16` on CPU | Texts per forward pass. |
 | `EMBEDDING_MAX_SEQ_LENGTH` | `2048` (model native) | Truncate inputs to this many tokens. |
 | `EMBEDDING_MAX_BATCH_TEXTS` | `256` | Server: cap on texts gathered from concurrent requests into one model call. |
-| `EMBEDDING_BATCH_WAIT_MS` | `2` | Server: how long an idle batch worker waits for more requests after the first arrives. |
+| `EMBEDDING_BATCH_WAIT_MS` | `2` | Server: how long a busy batch worker waits for more requests after taking the backlog. An idle worker skips the wait and runs the first request immediately. |
 | `HOST` / `PORT` | `0.0.0.0` / `8001` | Bind address for the start script. |
 
 ---
