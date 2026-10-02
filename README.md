@@ -426,7 +426,28 @@ The `server-rocm` image targets gfx908, gfx90a, gfx942, gfx1030, gfx1100–1102,
 gfx1150, gfx1151, gfx1200 and gfx1201. Only `rocm-wsl` and `cpu` have been
 tested so far (Radeon 890M / gfx1150 under
 WSL2: both models fully offloaded, Gemma ≈ 2.3× and Qwen ≈ 2.4× the CPU
-throughput; see [`docs/rocm_wsl_spike.md`](docs/rocm_wsl_spike.md)).
+throughput, output matching the CPU path, stable under a 5-minute load test).
+
+### ROCm on WSL2 setup
+
+One-time host setup for the `rocm-wsl` backend (the image brings ROCm itself;
+only AMD's WSL bridge library is needed in WSL):
+
+1. **Windows:** install the latest AMD Software: Adrenalin Edition driver for
+   your GPU, then in an admin PowerShell run `wsl --update` and `wsl --shutdown`.
+2. **WSL:** install [librocdxg](https://github.com/ROCm/librocdxg):
+
+   ```bash
+   cd /tmp
+   curl -LO https://github.com/ROCm/librocdxg/releases/download/v1.2.2/rocdxg-roct_1.2.2_amd64.deb
+   sudo dpkg -i rocdxg-roct_1.2.2_amd64.deb
+   ls /opt/rocm/lib/librocdxg.so /opt/rocm/share/rocdxg/dids.conf /usr/lib/wsl/lib/libdxcore.so
+   ```
+
+If `start` reports no usable GPU, tell librocdxg the device ID (find it in
+Windows Device Manager → the GPU → Details → Hardware Ids; `0x150E` is the
+Radeon 890M, gfx1150):
+`echo '0x150E,11,5,0' | sudo tee -a /opt/rocm/share/rocdxg/dids.conf`.
 
 ### Cross-request batching
 
@@ -474,8 +495,17 @@ checks the model servers' logs for this and warns. `--pull` updates the
 llama.cpp image to the latest build.
 
 LAN access under WSL2 needs mirrored networking and inbound firewall rules for
-the port, in both Windows Defender and the Hyper-V firewall (see Step 1 of the
-spike doc).
+the port, in both Windows Defender and the Hyper-V firewall. In an admin
+PowerShell (`{40E0AC32-…}` is WSL's VM creator id), then `wsl --shutdown`:
+
+```powershell
+New-NetFirewallRule -DisplayName "Embedding service 8001" -Direction Inbound `
+  -Protocol TCP -LocalPort 8001 -Action Allow
+New-NetFirewallHyperVRule -Name "EmbeddingService8001" `
+  -DisplayName "Embedding service 8001 (WSL)" -Direction Inbound `
+  -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' `
+  -Protocol TCP -LocalPorts 8001 -Action Allow
+```
 
 ---
 
@@ -580,8 +610,6 @@ settings (`embedding_service.env`) are gitignored. The old
 ├── docker/
 │   ├── gateway.Dockerfile            # gateway + model-fetch image
 │   └── compose.<backend>.yml         # GPU overlays: rocm-wsl, rocm, cuda, vulkan
-├── docs/
-│   └── rocm_wsl_spike.md             # ROCm-on-WSL2 Docker validation
 ├── sample_data/
 │   └── eli5_question_answer.jsonl    # sample QA pairs (Git LFS)
 ├── docker-compose.yml

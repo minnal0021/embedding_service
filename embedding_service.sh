@@ -216,7 +216,7 @@ check_backend() {
           /opt/rocm/share/rocdxg/dids.conf; do
         [[ -e "${f}" ]] || missing+=("${f}")
       done
-      (( ${#missing[@]} )) && echo "Install librocdxg (https://github.com/ROCm/librocdxg) and a recent AMD Windows driver; see docs/rocm_wsl_spike.md." >&2
+      (( ${#missing[@]} )) && echo "Install librocdxg (https://github.com/ROCm/librocdxg) and a recent AMD Windows driver; see README "ROCm on WSL2 setup"." >&2
       ;;
     rocm)
       [[ -e /dev/kfd ]] || missing+=(/dev/kfd)

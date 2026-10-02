@@ -231,5 +231,8 @@ embedding_service.log
 # Settings of the last `embedding_service.sh start` (machine-specific)
 embedding_service.env
 
+# Local working notes
+docs/
+
 # Generated sample embeddings (parquet output)
 embedding/

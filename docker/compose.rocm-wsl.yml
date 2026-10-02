@@ -1,5 +1,5 @@
 # AMD GPU under WSL2 (ROCm through /dev/dxg). Validated on a Radeon 890M
-# (gfx1150); see docs/rocm_wsl_spike.md.
+# (gfx1150); host setup: README "ROCm on WSL2 setup".
 # Host needs a recent AMD Adrenalin driver on Windows and librocdxg in WSL
 # (https://github.com/ROCm/librocdxg). The image brings ROCm itself.
 x-rocm-wsl: &rocm-wsl
