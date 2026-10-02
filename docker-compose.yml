@@ -15,7 +15,7 @@
 #   LOCAL_UID, LOCAL_GID     owner for files model-fetch writes to the cache
 #   EMBEDDING_MAX_BATCH_TEXTS, EMBEDDING_BATCH_WAIT_MS
 #                            gateway cross-request batching (see src/server.py)
-#   LLAMA_GEMMA_PARALLEL     gemma llama-server slots (4)
+#   LLAMA_PARALLEL           slots per model server (4)
 name: embedding-service
 
 x-model-env: &model-env
@@ -23,7 +23,12 @@ x-model-env: &model-env
   EMBEDDING_GEMMA_GGUF: ${EMBEDDING_GEMMA_GGUF:-}
   EMBEDDING_QWEN_GGUF: ${EMBEDDING_QWEN_GGUF:-}
 
-# Shared by both model servers. Context and batch sizes per model mirror
+# Shared by both model servers. -np (LLAMA_PARALLEL) is how many sequences
+# a server runs at once; the gateway's batches are split across them. -kvu
+# shares the context between those slots, so each sequence can still use the
+# model's whole context: for gemma (bidirectional attention, no KV cache) extra
+# slots cost no memory, and qwen's 8192-token KV cache is shared, not
+# multiplied. Context and batch sizes per model mirror
 # n_ctx in src/models.py (llama.cpp needs a whole sequence in one micro-batch
 # to pool it, so -b = -ub = -c).
 x-llama: &llama
@@ -76,13 +81,10 @@ services:
   llama-gemma:
     <<: *llama
     profiles: [gemma]
-    # -np: sequences llama-server runs at once (the gateway's batches are split
-    # across them). -kvu shares the context so each still gets all 2048 tokens;
-    # gemma's attention is bidirectional, so extra slots cost no KV memory.
     command: >-
       -m /models/active/gemma.gguf --embedding --pooling mean
       -c 2048 -b 2048 -ub 2048 -ngl 99
-      -np ${LLAMA_GEMMA_PARALLEL:-4} -kvu
+      -np ${LLAMA_PARALLEL:-4} -kvu
 
   llama-qwen:
     <<: *llama
@@ -90,3 +92,4 @@ services:
     command: >-
       -m /models/active/qwen.gguf --embedding --pooling last
       -c 8192 -b 8192 -ub 8192 -ngl 99
+      -np ${LLAMA_PARALLEL:-4} -kvu

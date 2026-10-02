@@ -43,8 +43,10 @@ START OPTIONS                        DEFAULT          ALLOWED VALUES
         f16     15.1 GB     ~21 GB                full precision
 
       GPU memory includes ~6 GB of KV cache and compute buffers for Qwen's
-      8192-token batch; Gemma adds ~0.4 GB. Vectors from different builds are
-      close but not identical: don't mix them in one index.
+      8192-token batch; Gemma adds ~0.5 GB. Under load it grows by ~1.8 GB
+      more (measured: both models 11.4 GB after start, 13.1 GB after use).
+      Vectors from different builds are close but not identical: don't mix
+      them in one index.
 
   --backend NAME                     auto             auto | rocm-wsl | rocm |
                                                       cuda | vulkan | cpu
@@ -87,7 +89,8 @@ ENVIRONMENT (used when the matching option is not given)
                              batching concurrent requests (default: 256)
   EMBEDDING_BATCH_WAIT_MS    how long a busy gateway waits to fill a batch
                              (default: 2; an idle one never waits)
-  LLAMA_GEMMA_PARALLEL       sequences gemma's llama-server runs at once (default: 4)
+  LLAMA_PARALLEL             sequences each model server (gemma, qwen) runs at
+                             once (default: 4)
 
 FILES
   embedding_service.env   settings of the last start, read by stop / status /
@@ -372,7 +375,7 @@ LOCAL_GID=$(id -g)
 EOF
   # Tuning knobs, kept only when set so the compose defaults apply otherwise.
   local var
-  for var in EMBEDDING_MAX_BATCH_TEXTS EMBEDDING_BATCH_WAIT_MS LLAMA_GEMMA_PARALLEL; do
+  for var in EMBEDDING_MAX_BATCH_TEXTS EMBEDDING_BATCH_WAIT_MS LLAMA_PARALLEL; do
     if [[ -n "${!var:-}" ]]; then
       echo "${var}=${!var}" >>"${STATE_FILE}"
     fi

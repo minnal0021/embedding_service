@@ -100,6 +100,10 @@ Memory: Qwen at the default Q4_K_M uses about 10.6 GB of GPU memory in total
 (4.5 GB weights, plus KV cache and compute buffers for its 8192-token batch).
 `--qwen-quant Q8_0` (near-lossless) needs ~14 GB and `--qwen-quant f16` (full
 precision) ~21 GB. On small machines load only Gemma (`--models gemma`).
+Measured with both models on a Radeon 890M (ROCm, WSL2): ~11.4 GB right after
+start, growing to ~13.1 GB once they have served traffic (the ROCm runtime
+keeps the working buffers it allocates). Leave room for that when other
+programs share the GPU. The slot count (`LLAMA_PARALLEL`) doesn't change it.
 
 ---
 
@@ -390,7 +394,7 @@ offline pipeline):
 | `EMBEDDING_REQUEST_TIMEOUT` | `600` | Gateway: seconds to wait for one call to a model server. |
 | `EMBEDDING_MAX_BATCH_TEXTS` | `256` | Gateway: max texts per model call when batching concurrent requests. |
 | `EMBEDDING_BATCH_WAIT_MS` | `2` | Gateway: how long a busy worker waits for more requests to batch (an idle one never waits). |
-| `LLAMA_GEMMA_PARALLEL` | `4` | Sequences gemma's `llama-server` runs at once. |
+| `LLAMA_PARALLEL` | `4` | Sequences each model's `llama-server` (gemma and qwen) runs at once. |
 | `SERVICE_URL` | `http://localhost:8001` | Service the test script targets. |
 
 `start` saves its settings in `embedding_service.env` (gitignored), which
@@ -437,10 +441,13 @@ one bad request cannot fail its neighbours. An idle worker sends a lone
 request immediately; a busy one waits up to `EMBEDDING_BATCH_WAIT_MS` (2 ms)
 for more, up to `EMBEDDING_MAX_BATCH_TEXTS` (256) texts per call.
 
-`llama-server` then runs the texts of a call `LLAMA_GEMMA_PARALLEL` (4) at a
-time. Gemma's attention is bidirectional, so it has no KV cache and more slots
-cost no memory; with a fast GPU, raising this lets each GPU pass hold more of
-a batch. Measure before changing it, with many requests in flight.
+Each model's `llama-server` then runs the texts of a call `LLAMA_PARALLEL`
+(4) at a time; the setting applies to both models. The slots share the
+model's context (`-kvu`), so each text can still use all of it, and extra
+slots add little memory: Gemma's attention is bidirectional, so it has no KV
+cache, and Qwen's 8192-token KV cache is shared between the slots rather than
+multiplied. With a fast GPU, raising this lets each GPU pass hold more of a
+batch. Measure before changing it, with many requests in flight.
 
 ### Throughput
 
@@ -459,7 +466,7 @@ Baseline for the Radeon AI PRO R9700, from the previous PyTorch ROCm runtime
 | 64 | **~58** |
 
 The llama.cpp setup hasn't been measured on the R9700 yet; compare against
-these numbers with many requests in flight, and tune `LLAMA_GEMMA_PARALLEL`
+these numbers with many requests in flight, and tune `LLAMA_PARALLEL`
 there.
 
 llama.cpp falls back to the CPU silently if it finds no usable GPU. `start`
