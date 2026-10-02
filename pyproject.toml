@@ -13,14 +13,13 @@ dependencies = [
 ]
 
 [dependency-groups]
-# In-process llama.cpp (EmbeddingService) and the offline sample-embedding /
-# centroid pipeline. Installed by default for local `uv sync` / `uv run`.
+# The offline sample-embedding / centroid pipeline (embeddings come from the
+# running service). Installed by default for local `uv sync` / `uv run`.
 tools = [
     "pandas",
     "pyarrow",
     "tqdm",
     "scikit-learn",
-    "llama-cpp-python>=0.3.36",
 ]
 
 [tool.uv]

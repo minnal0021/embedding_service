@@ -28,9 +28,10 @@ x-model-env: &model-env
 # shares the context between those slots, so each sequence can still use the
 # model's whole context: for gemma (bidirectional attention, no KV cache) extra
 # slots cost no memory, and qwen's 8192-token KV cache is shared, not
-# multiplied. Context and batch sizes per model mirror
-# n_ctx in src/models.py (llama.cpp needs a whole sequence in one micro-batch
-# to pool it, so -b = -ub = -c).
+# multiplied. Per model: pooling (gemma mean; qwen3-embedding pools the final
+# EOS token, so last) and context (gemma's native 2048; qwen supports 32k,
+# capped at 8192 to bound KV-cache and compute memory). llama.cpp needs a whole
+# sequence in one micro-batch to pool it, so -b = -ub = -c.
 x-llama: &llama
   image: ghcr.io/ggml-org/llama.cpp:server
   restart: unless-stopped

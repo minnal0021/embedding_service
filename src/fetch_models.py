@@ -2,7 +2,7 @@
 
 Run by the `model-fetch` service in docker-compose.yml before the model
 servers start. Each GGUF goes into the Hugging Face cache layout under the
-cache dir (shared with the in-process EmbeddingService), and
+cache dir, and
 <cache>/active/<model>.gguf is pointed at it with a relative symlink, so the
 containers can load a fixed path without knowing the snapshot hash.
 
