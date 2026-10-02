@@ -1,0 +1,92 @@
+# Embedding service: a FastAPI gateway (the only LAN-facing port) in front of
+# one llama.cpp `llama-server` per model.
+#
+# Normally driven by ./embedding_service.sh, which picks the models (compose
+# profiles `gemma` / `qwen`) and adds the GPU overlay for this machine from
+# docker/compose.<backend>.yml. On its own this file runs everything on the CPU.
+#
+# Variables (set by embedding_service.sh, all optional):
+#   HOST, PORT               gateway bind address/port (0.0.0.0:8001)
+#   EMBEDDING_MODELS         models the gateway serves (gemma,qwen)
+#   EMBEDDING_CACHE_PATH     host model cache, mounted at /models (./model_cache)
+#   EMBEDDING_GEMMA_GGUF     GGUF build per model (defaults in src/models.py)
+#   EMBEDDING_QWEN_GGUF
+#   LLAMA_BACKEND            backend the overlay provides, for /healthcheck (cpu)
+#   LOCAL_UID, LOCAL_GID     owner for files model-fetch writes to the cache
+#   EMBEDDING_MAX_BATCH_TEXTS, EMBEDDING_BATCH_WAIT_MS
+#                            gateway cross-request batching (see src/server.py)
+#   LLAMA_GEMMA_PARALLEL     gemma llama-server slots (4)
+name: embedding-service
+
+x-model-env: &model-env
+  EMBEDDING_MODELS: ${EMBEDDING_MODELS:-gemma,qwen}
+  EMBEDDING_GEMMA_GGUF: ${EMBEDDING_GEMMA_GGUF:-}
+  EMBEDDING_QWEN_GGUF: ${EMBEDDING_QWEN_GGUF:-}
+
+# Shared by both model servers. Context and batch sizes per model mirror
+# n_ctx in src/models.py (llama.cpp needs a whole sequence in one micro-batch
+# to pool it, so -b = -ub = -c).
+x-llama: &llama
+  image: ghcr.io/ggml-org/llama.cpp:server
+  restart: unless-stopped
+  volumes:
+    - ${EMBEDDING_CACHE_PATH:-./model_cache}:/models:ro
+  environment:
+    LLAMA_ARG_HOST: 0.0.0.0
+    LLAMA_ARG_PORT: "8080"
+  depends_on:
+    model-fetch:
+      condition: service_completed_successfully
+
+services:
+  # One-shot: download the GGUFs and point /models/active/<model>.gguf at them.
+  model-fetch:
+    # Built by the gateway service (one build; two identical ones race).
+    image: embedding-service-gateway:latest
+    pull_policy: never
+    command: ["python", "src/fetch_models.py"]
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      <<: *model-env
+      EMBEDDING_CACHE_PATH: /models
+      HF_HOME: /tmp/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${EMBEDDING_CACHE_PATH:-./model_cache}:/models
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    image: embedding-service-gateway:latest
+    restart: unless-stopped
+    ports:
+      - "${HOST:-0.0.0.0}:${PORT:-8001}:8001"
+    environment:
+      <<: *model-env
+      LLAMA_BACKEND: ${LLAMA_BACKEND:-cpu}
+      EMBEDDING_MAX_BATCH_TEXTS: ${EMBEDDING_MAX_BATCH_TEXTS:-256}
+      EMBEDDING_BATCH_WAIT_MS: ${EMBEDDING_BATCH_WAIT_MS:-2}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthcheck', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 10m
+
+  llama-gemma:
+    <<: *llama
+    profiles: [gemma]
+    # -np: sequences llama-server runs at once (the gateway's batches are split
+    # across them). -kvu shares the context so each still gets all 2048 tokens;
+    # gemma's attention is bidirectional, so extra slots cost no KV memory.
+    command: >-
+      -m /models/active/gemma.gguf --embedding --pooling mean
+      -c 2048 -b 2048 -ub 2048 -ngl 99
+      -np ${LLAMA_GEMMA_PARALLEL:-4} -kvu
+
+  llama-qwen:
+    <<: *llama
+    profiles: [qwen]
+    command: >-
+      -m /models/active/qwen.gguf --embedding --pooling last
+      -c 8192 -b 8192 -ub 8192 -ngl 99

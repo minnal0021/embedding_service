@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 #
-# Test the EmbeddingGemma-300M batch embedding service.
-# Tests both /embedding/query and /embedding/document endpoints,
-# and verifies dimension truncation works correctly.
+# Test the batch embedding service.
+# For each model, tests /embedding/{model}/query and /embedding/{model}/document
+# and verifies Matryoshka dimension truncation. Also checks that unknown model
+# names (and the old model-less paths) return 404.
 #
 # Usage:
-#   ./test_embeddings.sh [service-url]
+#   ./test_embeddings.sh [MODEL]
+#
+#   MODEL   gemma | qwen. If omitted, every model the service reports as
+#           loaded (via /healthcheck) is tested.
 #
 # Environment overrides:
-#   SERVICE_URL   Embedding service base URL  (default: http://localhost:8000)
-#   DIMENSIONS    Embedding dimensions        (default: 768)
+#   SERVICE_URL   Embedding service base URL  (default: http://localhost:8001)
 
-SERVICE_URL="${1:-${SERVICE_URL:-http://localhost:8001}}"
-DIMENSIONS="${DIMENSIONS:-768}"
+SERVICE_URL="${SERVICE_URL:-http://localhost:8001}"
+MODEL_ARG="${1:-}"
+
+if [[ "${MODEL_ARG}" == "-h" || "${MODEL_ARG}" == "--help" ]]; then
+  sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
 
 echo "════════════════════════════════════════════════════════════════"
-echo "  EmbeddingGemma-300M Service – Test Suite"
+echo "  Embedding Service – Test Suite"
 echo "════════════════════════════════════════════════════════════════"
 echo "  Service    : ${SERVICE_URL}"
-echo "  Dimensions : ${DIMENSIONS}"
+echo "  Model(s)   : ${MODEL_ARG:-all loaded}"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -33,14 +41,33 @@ else
   echo "  Make sure the service is running at ${SERVICE_URL}" >&2
   exit 1
 fi
+
+# "<model> <native-dim> <default-dim>" per loaded model, one per line.
+LOADED="$(echo "${health}" | python3 -c "
+import json, sys
+for key, m in json.load(sys.stdin)['models'].items():
+    print(key, m['dimension'], m['default_dimension'])
+")"
+echo "${LOADED}" | while read -r m dim def; do echo "  loaded: ${m} (native ${dim} dims, default ${def})"; done
 echo ""
 
+if [[ -n "${MODEL_ARG}" ]]; then
+  SELECTED="$(echo "${LOADED}" | awk -v m="${MODEL_ARG}" '$1 == m')"
+  if [[ -z "${SELECTED}" ]]; then
+    echo "  ❌ Model '${MODEL_ARG}' is not loaded (loaded: $(echo "${LOADED}" | awk '{print $1}' | tr '\n' ' '))" >&2
+    exit 1
+  fi
+else
+  SELECTED="${LOADED}"
+fi
+
 # Validate one endpoint's response: correct count, dimension, and L2 norm.
-check_embeddings() {
-    python3 - "$1" "$2" <<'EOF'
+# The response goes in on stdin: a 4096-dim batch overflows the argv limit.
+# (`read -d ''` rather than a heredoc in $(...), which macOS's bash 3.2 misparses.)
+read -r -d '' CHECK_EMBEDDINGS_PY <<'EOF' || true
 import sys, json, math
-data = json.loads(sys.argv[1])
-expected_dim = int(sys.argv[2])
+data = json.load(sys.stdin)
+expected_dim = int(sys.argv[1])
 embeddings = data.get("embeddings", [])
 print(f"  Embeddings returned: {len(embeddings)}")
 all_pass = True
@@ -59,70 +86,87 @@ if not all_pass:
     sys.exit(1)
 print("  ✅ PASS (all L2-normalised)")
 EOF
+check_embeddings() {
+    printf '%s' "$1" | python3 -c "${CHECK_EMBEDDINGS_PY}" "$2"
+}
+
+# POST a body to an endpoint; prints the response body, then the HTTP status
+# on the last line.
+post() {
+    curl -sS --max-time 600 -w '\n%{http_code}' \
+        -X POST "${SERVICE_URL}$1" \
+        -H "Content-Type: application/json" \
+        -d "$2"
 }
 
 # POST a body to an endpoint, assert HTTP 200, and validate the embeddings.
 post_and_check() {
-    local endpoint="$1" body="$2"
+    local endpoint="$1" body="$2" dim="$3"
     local resp http body_resp
-    resp="$(curl -sS -w '\n__HTTP_STATUS__%{http_code}' \
-        -X POST "${SERVICE_URL}${endpoint}" \
-        -H "Content-Type: application/json" \
-        -d "${body}")"
-    http="$(echo "${resp}" | grep '__HTTP_STATUS__' | sed 's/__HTTP_STATUS__//')"
-    body_resp="$(echo "${resp}" | grep -v '__HTTP_STATUS__')"
+    resp="$(post "${endpoint}" "${body}")"
+    http="$(echo "${resp}" | tail -n 1)"
+    body_resp="$(echo "${resp}" | sed '$d')"
     if [[ "${http}" != "200" ]]; then
         echo "  ❌ FAIL: HTTP ${http}"
         echo "${body_resp}" | python3 -m json.tool 2>/dev/null || echo "${body_resp}"
         exit 1
     fi
-    check_embeddings "${body_resp}" "${DIMENSIONS}"
+    check_embeddings "${body_resp}" "${dim}"
 }
 
-# ── Test 1: Batch Query Embedding ────────────────────────────────────
-echo "── Test 1: Batch Query Embedding (/embedding/query) ──────────"
-QUERY_BODY="{\"payloads\": [\"hello world\", \"What is machine learning?\"], \"dimensions\": ${DIMENSIONS}}"
-post_and_check "/embedding/query" "${QUERY_BODY}"
-echo ""
+# Assert that POSTing to an endpoint returns 404.
+expect_404() {
+    local http
+    http="$(post "$1" '{"payloads": ["hello"]}' | tail -n 1)"
+    if [[ "${http}" == "404" ]]; then
+        echo "  ✅ $1 → 404"
+    else
+        echo "  ❌ FAIL: $1 → HTTP ${http} (expected 404)"
+        exit 1
+    fi
+}
 
-# ── Test 2: Batch Document Embedding ─────────────────────────────────
-echo "── Test 2: Batch Document Embedding (/embedding/document) ────"
-DOC_PAYLOADS='["The court filed the complaint on Tuesday.", "Meta used copyrighted works to train Llama.", "Engineers relied on pirated books and articles."]'
-DOC_BODY="{\"payloads\": ${DOC_PAYLOADS}, \"dimensions\": ${DIMENSIONS}}"
-post_and_check "/embedding/document" "${DOC_BODY}"
-echo ""
+# Run the per-model suite.
+test_model() {
+    local m="$1" native="$2" default="$3"
+    local base="/embedding/${m}"
 
-# ── Test 3: Dimension Truncation ─────────────────────────────────────
-# EmbeddingGemma's native width is 768; Matryoshka truncation lets callers
-# request a smaller width (e.g. 256). Requesting >768 is not truncation and
-# returns the full 768, so we compare the full width against a truncated one.
-echo "── Test 3: Dimension Truncation ──────────────────────────────"
-DIM_A=768
-DIM_B=256
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Model: ${m} (native ${native} dims)"
+    echo "════════════════════════════════════════════════════════════════"
 
-body_a="{\"payloads\": [\"What is machine learning?\"], \"dimensions\": ${DIM_A}}"
-resp_a="$(curl -sS --max-time 120 -X POST "${SERVICE_URL}/embedding/query" \
-  -H "Content-Type: application/json" -d "${body_a}" 2>/dev/null)"
-len_a="$(echo "${resp_a}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['embeddings'][0]))")"
+    echo "── Test 1: Batch Query Embedding (${base}/query) ──"
+    post_and_check "${base}/query" \
+        "{\"payloads\": [\"hello world\", \"What is machine learning?\"], \"dimensions\": ${native}}" \
+        "${native}"
+    echo ""
 
-body_b="{\"payloads\": [\"What is machine learning?\"], \"dimensions\": ${DIM_B}}"
-resp_b="$(curl -sS --max-time 120 -X POST "${SERVICE_URL}/embedding/query" \
-  -H "Content-Type: application/json" -d "${body_b}" 2>/dev/null)"
-len_b="$(echo "${resp_b}" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['embeddings'][0]))")"
+    echo "── Test 2: Batch Document Embedding (${base}/document) ──"
+    local docs='["The court filed the complaint on Tuesday.", "Meta used copyrighted works to train Llama.", "Engineers relied on pirated books and articles."]'
+    post_and_check "${base}/document" "{\"payloads\": ${docs}, \"dimensions\": ${native}}" "${native}"
+    echo ""
 
-echo "  dimensions=${DIM_A}  →  got ${len_a}"
-echo "  dimensions=${DIM_B}  →  got ${len_b}"
+    echo "── Test 3: Default dimensions (omitted → ${default}) ──"
+    post_and_check "${base}/query" '{"payloads": ["What is machine learning?"]}' "${default}"
+    echo ""
 
-PASS=1
-[[ "${len_a}" -ne "${DIM_A}" ]] && echo "  ❌ Expected ${DIM_A}, got ${len_a}" && PASS=0
-[[ "${len_b}" -ne "${DIM_B}" ]] && echo "  ❌ Expected ${DIM_B}, got ${len_b}" && PASS=0
-[[ "${len_a}" -eq "${len_b}" ]] && echo "  ❌ Both same dimension — truncation broken" && PASS=0
+    # Matryoshka truncation lets callers request a smaller width.
+    echo "── Test 4: Dimension Truncation (${native} → 256) ──"
+    post_and_check "${base}/query" '{"payloads": ["What is machine learning?"], "dimensions": 256}' 256
+    echo ""
+}
 
-if [[ "${PASS}" -eq 1 ]]; then
-  echo "  ✅ PASS"
-else
-  exit 1
-fi
+while read -r m dim def; do
+    test_model "${m}" "${dim}" "${def}"
+done <<<"${SELECTED}"
+
+# ── Unknown model / legacy paths ─────────────────────────────────────
+echo "════════════════════════════════════════════════════════════════"
+echo "── Test: Unknown model and legacy paths return 404 ──"
+expect_404 "/embedding/bogus/query"
+expect_404 "/embedding/bogus/document"
+expect_404 "/embedding/query"
+expect_404 "/embedding/document"
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────

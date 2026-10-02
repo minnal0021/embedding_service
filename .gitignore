@@ -225,5 +225,11 @@ fastembed_cache/
 embedding_service.pid
 embedding_service.log
 
+# llama.cpp backend setup marker written by install_backend.sh (machine-specific)
+.backend_setup_complete
+
+# Settings of the last `embedding_service.sh start` (machine-specific)
+embedding_service.env
+
 # Generated sample embeddings (parquet output)
 embedding/

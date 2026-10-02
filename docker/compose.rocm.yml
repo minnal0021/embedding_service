@@ -1,0 +1,12 @@
+# AMD GPU on native Linux (ROCm kernel driver: /dev/kfd + /dev/dri).
+x-rocm: &rocm
+  image: ghcr.io/ggml-org/llama.cpp:server-rocm
+  devices:
+    - /dev/kfd:/dev/kfd
+    - /dev/dri:/dev/dri
+  security_opt:
+    - seccomp=unconfined
+
+services:
+  llama-gemma: *rocm
+  llama-qwen: *rocm

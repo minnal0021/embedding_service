@@ -1,0 +1,9 @@
+# Any GPU with a Vulkan driver on native Linux (/dev/dri).
+x-vulkan: &vulkan
+  image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+  devices:
+    - /dev/dri:/dev/dri
+
+services:
+  llama-gemma: *vulkan
+  llama-qwen: *vulkan

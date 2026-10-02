@@ -2,34 +2,26 @@
 name = "embedding-service"
 version = "0.1.0"
 requires-python = ">=3.14"
+# The HTTP gateway (src/server.py) and model download (src/fetch_models.py) —
+# all the Docker gateway image installs.
 dependencies = [
-    # PyTorch runtime: EmbeddingGemma's original weights via sentence-transformers.
-    # torch comes from PyTorch's ROCm wheel index (see [tool.uv.sources]), which
-    # runs natively on AMD GPUs through HIP and falls back to the CPU when no
-    # supported GPU is present.
-    "torch",
-    # torch's ROCm build depends on triton-rocm, which exists only on the ROCm
-    # index; uv routes [tool.uv.sources] for direct dependencies only, so list it.
-    "triton-rocm; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "sentence-transformers",
     "fastapi",
     "uvicorn",
     "numpy",
+    "httpx",
+    "huggingface-hub>=1.21.0",
+]
+
+[dependency-groups]
+# In-process llama.cpp (EmbeddingService) and the offline sample-embedding /
+# centroid pipeline. Installed by default for local `uv sync` / `uv run`.
+tools = [
     "pandas",
     "pyarrow",
     "tqdm",
     "scikit-learn",
+    "llama-cpp-python>=0.3.36",
 ]
 
-# ROCm 7.1 build of PyTorch (bundles its own ROCm libraries; needs only the
-# in-kernel amdgpu driver and access to /dev/kfd). Its gfx target list includes
-# RDNA4 (gfx1200/gfx1201, e.g. Radeon AI PRO R9700). The ROCm index only ships
-# Linux x86_64 wheels; other platforms fall back to the regular PyPI torch.
-[[tool.uv.index]]
-name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm7.1"
-explicit = true
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
-triton-rocm = [{ index = "pytorch-rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+[tool.uv]
+default-groups = ["tools"]

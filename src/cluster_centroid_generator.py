@@ -10,10 +10,12 @@ Usage:
     python src/cluster_centroid_generator.py [OPTIONS]
 
 Options:
+    --model         Model whose sample embeddings to cluster: gemma | qwen
+                    (required; selects the default input/output paths)
     --input         Path to the embedding parquet file
-                    (default: embedding/sample_data_embedding.parquet)
+                    (default: embedding/<model>/sample_data_embedding.parquet)
     --output        Path to the output JSONL file
-                    (default: embedding/cluster_centroids.jsonl)
+                    (default: embedding/<model>/cluster_centroids.jsonl)
     --embedding-col Name of the embedding column in the parquet file
                     (default: qa_embedding)
     --dimensions    Embedding width to cluster on; Matryoshka-truncated +
@@ -37,6 +39,8 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 
+from models import MODELS
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -46,8 +50,8 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_INPUT = "embedding/sample_data_embedding.parquet"
-DEFAULT_OUTPUT = "embedding/cluster_centroids.jsonl"
+DEFAULT_INPUT = "embedding/{model}/sample_data_embedding.parquet"
+DEFAULT_OUTPUT = "embedding/{model}/cluster_centroids.jsonl"
 DEFAULT_EMBEDDING_COL = "qa_embedding"
 DEFAULT_DIMENSIONS = 768
 DEFAULT_N_CLUSTERS = 256
@@ -74,8 +78,8 @@ class ClusterCentroidGenerator:
 
     def __init__(
         self,
-        input_path: str = DEFAULT_INPUT,
-        output_path: str = DEFAULT_OUTPUT,
+        input_path: str,
+        output_path: str,
         embedding_col: str = DEFAULT_EMBEDDING_COL,
         dimensions: int = DEFAULT_DIMENSIONS,
         n_clusters: int = DEFAULT_N_CLUSTERS,
@@ -181,13 +185,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Cluster sample embeddings with K-means and write centroids to JSONL.",
     )
     p.add_argument(
+        "--model",
+        required=True,
+        choices=list(MODELS),
+        help="Model whose sample embeddings to cluster",
+    )
+    p.add_argument(
         "--input",
-        default=DEFAULT_INPUT,
+        default=None,
         help=f"Path to embedding parquet (default: {DEFAULT_INPUT})",
     )
     p.add_argument(
         "--output",
-        default=DEFAULT_OUTPUT,
+        default=None,
         help=f"Output JSONL path (default: {DEFAULT_OUTPUT})",
     )
     p.add_argument(
@@ -220,8 +230,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     generator = ClusterCentroidGenerator(
-        input_path=args.input,
-        output_path=args.output,
+        input_path=args.input or DEFAULT_INPUT.format(model=args.model),
+        output_path=args.output or DEFAULT_OUTPUT.format(model=args.model),
         embedding_col=args.embedding_col,
         dimensions=args.dimensions,
         n_clusters=args.n_clusters,

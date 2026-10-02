@@ -1,0 +1,19 @@
+# AMD GPU under WSL2 (ROCm through /dev/dxg). Validated on a Radeon 890M
+# (gfx1150); see docs/rocm_wsl_spike.md.
+# Host needs a recent AMD Adrenalin driver on Windows and librocdxg in WSL
+# (https://github.com/ROCm/librocdxg). The image brings ROCm itself.
+x-rocm-wsl: &rocm-wsl
+  image: ghcr.io/ggml-org/llama.cpp:server-rocm
+  devices:
+    - /dev/dxg:/dev/dxg
+  volumes:
+    - /usr/lib/wsl/lib/libdxcore.so:/usr/lib/libdxcore.so:ro
+    - /opt/rocm/lib/librocdxg.so:/usr/lib/librocdxg.so:ro
+    - /opt/rocm/share/rocdxg/dids.conf:/usr/share/rocdxg/dids.conf:ro
+  environment:
+    # Required for the image's ROCm 7.2.x to use the WSL bridge.
+    HSA_ENABLE_DXG_DETECTION: "1"
+
+services:
+  llama-gemma: *rocm-wsl
+  llama-qwen: *rocm-wsl
