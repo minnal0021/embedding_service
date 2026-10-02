@@ -26,12 +26,10 @@ a vector is never implicit.
 - [HTTP API](#http-api)
 - [Migrating from the single-model API](#migrating-from-the-single-model-api)
 - [Models](#models)
-- [The `EmbeddingService` class](#the-embeddingservice-class)
 - [Offline pipeline: sample embeddings → centroids](#offline-pipeline-sample-embeddings--centroids)
 - [Scripts](#scripts)
 - [Configuration](#configuration)
 - [GPU backends (Docker)](#gpu-backends-docker)
-- [In-process GPU builds (offline pipeline)](#in-process-gpu-builds-offline-pipeline)
 - [Sample data & Git LFS](#sample-data--git-lfs)
 - [Project layout](#project-layout)
 
@@ -55,7 +53,7 @@ a vector is never implicit.
                         └───────┬─────────┘
                     ./model_cache  (GGUFs, fetched by the model-fetch container)
 
-  Offline pipeline (no server required, in-process llama-cpp-python), per model:
+  Offline pipeline, per model (embeds through the running service):
 
   sample_data/*.jsonl ─► SampleEmbeddingGenerator ─► embedding/<model>/sample_data_embedding.parquet
                                                           │
@@ -89,11 +87,11 @@ For the service:
 - Network access on first run (models are downloaded from Hugging Face:
   ~330 MB for Gemma, ~5 GB for Qwen at Q4_K_M)
 
-For the offline pipeline (and `EmbeddingService` in-process):
+For the offline pipeline:
 
 - Python **≥ 3.14** and [`uv`](https://docs.astral.sh/uv/)
-- A C/C++ compiler (`llama-cpp-python` is built from source on install;
-  on macOS install the Xcode command-line tools: `xcode-select --install`)
+- The running service (it embeds through it), here or on another machine
+  (`SERVICE_URL`)
 - [Git LFS](https://git-lfs.com/) to check out the sample data
 
 Memory: Qwen at the default Q4_K_M uses about 10.6 GB of GPU memory in total
@@ -240,8 +238,9 @@ curl -X POST http://localhost:8001/embedding/qwen/query \
 
 ## Models
 
-Defined in `MODELS` in [`src/models.py`](src/models.py) (the context sizes
-and pooling are repeated in [`docker-compose.yml`](docker-compose.yml)). Both
+Defined in `MODELS` in [`src/models.py`](src/models.py); pooling and context
+size are set on each model's `llama-server` in
+[`docker-compose.yml`](docker-compose.yml). Both
 are loaded from official GGUF builds and downloaded into the model cache on
 first use.
 
@@ -263,42 +262,15 @@ lists sizes and GPU memory), or name any file with `EMBEDDING_QWEN_GGUF` /
 
 ---
 
-## The `EmbeddingService` class
-
-[`src/embedding_service.py`](src/embedding_service.py) wraps one llama.cpp model
-in-process through `llama-cpp-python`. The offline pipeline uses it, and you can
-use it directly without the service (see
-[In-process GPU builds](#in-process-gpu-builds-offline-pipeline) for GPU use):
-
-```python
-from embedding_service import EmbeddingService
-
-service = EmbeddingService("qwen")               # or "gemma"
-docs = service.embed_documents(["the cat sat on the mat"], dimensions=256)
-qry  = service.embed_query(["where did the cat sit?"], dimensions=256)
-```
-
-- `embed_documents(payloads, dimensions=768)` — applies the document prompt.
-- `embed_query(payloads, dimensions=768)` — applies the query prompt.
-- Both return `list[list[float]]`, truncated to `dimensions` (pass `None` for
-  the native width) and L2-normalised.
-- `load_models(["gemma", "qwen"])` returns a `{key: EmbeddingService}` dict.
-
-Run its `main()` demo:
-
-```bash
-uv run python src/embedding_service.py gemma
-```
-
----
-
 ## Offline pipeline: sample embeddings → centroids
 
 A two-stage offline pipeline turns the raw QA dataset into cluster centroids,
 **per model** — centroids from one model's vector space are meaningless for the
-other. Both stages run in-process (no server needed).
+other. Stage 1 embeds through the running service, so start it first with the
+model loaded; stage 2 only reads the saved embeddings.
 
 ```bash
+./embedding_service.sh start             # gemma + qwen (or --models qwen)
 ./generate_sample_embeddings.sh qwen     # → embedding/qwen/sample_data_embedding.parquet
 ./generate_cluster_centroids.sh qwen     # → embedding/qwen/cluster_centroids.jsonl
 ```
@@ -321,11 +293,15 @@ uv run python src/sample_embedding_generator.py \
 # --output defaults to embedding/<model>/sample_data_embedding.parquet
 ```
 
-`--dimensions` defaults to 768; `0` keeps the model's native width. The shell script
-reads `DIMENSIONS`, `BATCH_SIZE` and `MAX_RECORDS` (default 25000) from the
-environment. Qwen-8B is much slower than Gemma, especially on CPU (~1 s per QA
-pair on a 22-core x86 CPU vs ~12 pairs/s for Gemma), so use a GPU or a smaller
-`MAX_RECORDS` for it.
+`--dimensions` defaults to 768; `0` keeps the model's native width.
+`--service-url` (or `SERVICE_URL`, default `http://localhost:8001`) points it at
+the service, which may run on another machine; it checks the model is loaded
+and ready before starting. A batch the service rejects (e.g. a record longer
+than the model's context) is retried one record at a time and only the failing
+records are skipped. The shell script reads `DIMENSIONS`, `BATCH_SIZE`,
+`MAX_RECORDS` (default 25000) and `SERVICE_URL` from the environment. Qwen-8B
+is much slower than Gemma (~2 QA pairs/s on a Radeon 890M, ~1 s per pair on a
+22-core CPU), so use a GPU-backed service or a smaller `MAX_RECORDS` for it.
 
 Output Parquet schema: `question : string`, `answer : string`,
 `qa_embedding : list[float]`.
@@ -364,8 +340,7 @@ reads `DIMENSIONS`, `N_CLUSTERS` and `SEED` from the environment.
 | --- | --- |
 | [`embedding_service.sh start\|stop\|restart\|status\|logs`](embedding_service.sh) | `start`: build the gateway image, fetch the models, pick the GPU backend, start the containers, wait for health, smoke test each model (`-f` stays attached). `stop`: remove the containers. `restart`: both, with the last settings. `status`: containers and loaded models. `logs [service]`: follow the logs. |
 | [`test_embeddings.sh [MODEL]`](test_embeddings.sh) | Test suite per model (query/document embedding, default and truncated dimensions) plus 404 checks. No `MODEL` = every loaded model. |
-| [`install_backend.sh`](install_backend.sh) | Detect OS/CPU/GPU and build `llama-cpp-python` for the best backend (Metal / CUDA / HIP / Vulkan / CPU), for the in-process offline pipeline. Run automatically by the sample-embedding script. |
-| [`generate_sample_embeddings.sh MODEL`](generate_sample_embeddings.sh) | Embed the sample QA data with `MODEL`. |
+| [`generate_sample_embeddings.sh MODEL`](generate_sample_embeddings.sh) | Embed the sample QA data with `MODEL`, through the running service. |
 | [`generate_cluster_centroids.sh MODEL`](generate_cluster_centroids.sh) | Cluster `MODEL`'s sample embeddings into centroids. |
 
 `embedding_service.sh start` options: `--host`, `--port`, `--models`,
@@ -387,7 +362,6 @@ offline pipeline):
 | `EMBEDDING_QWEN_GGUF` | `Qwen3-Embedding-8B-Q4_K_M.gguf` | Qwen GGUF file in its repo (e.g. `Qwen3-Embedding-8B-Q8_0.gguf`). |
 | `EMBEDDING_CACHE_PATH` | `./model_cache` | Where GGUF files are downloaded (mounted into the containers). |
 | `EMBEDDING_BACKEND` | `auto` | llama.cpp image for the service: `auto`, `rocm-wsl`, `rocm`, `cuda`, `vulkan` or `cpu`. |
-| `EMBEDDING_DEVICE` | `auto` | In-process only: `auto` (GPU if available, CPU otherwise or if the GPU load fails), `gpu` (fail without one) or `cpu`. |
 | `HF_TOKEN` | — | Optional Hugging Face token for downloads. |
 | `HOST` / `PORT` | `0.0.0.0` / `8001` | Address the gateway is published on. |
 | `STARTUP_TIMEOUT` | `1800` | Seconds the start script waits for health. |
@@ -395,7 +369,7 @@ offline pipeline):
 | `EMBEDDING_MAX_BATCH_TEXTS` | `256` | Gateway: max texts per model call when batching concurrent requests. |
 | `EMBEDDING_BATCH_WAIT_MS` | `2` | Gateway: how long a busy worker waits for more requests to batch (an idle one never waits). |
 | `LLAMA_PARALLEL` | `4` | Sequences each model's `llama-server` (gemma and qwen) runs at once. |
-| `SERVICE_URL` | `http://localhost:8001` | Service the test script targets. |
+| `SERVICE_URL` | `http://localhost:8001` | Service the test and sample-embedding scripts use. |
 
 `start` saves its settings in `embedding_service.env` (gitignored), which
 `stop`, `status`, `logs` and `restart` read (the three tuning variables only
@@ -509,76 +483,6 @@ New-NetFirewallHyperVRule -Name "EmbeddingService8001" `
 
 ---
 
-## In-process GPU builds (offline pipeline)
-
-The offline pipeline (and `EmbeddingService`) runs llama.cpp in-process via
-`llama-cpp-python`, which picks its GPU backend **when it is compiled**, so GPU
-support is a build step. `./generate_sample_embeddings.sh` handles it:
-
-1. **First run**: there is no `.backend_setup_complete` file, so it runs
-   [`install_backend.sh`](install_backend.sh), which detects the OS
-   (macOS/Linux, WSL2), CPU and GPU, builds `llama-cpp-python` for the best
-   available backend, and records the result in `.backend_setup_complete`
-   (gitignored).
-2. **Later runs**: setup is skipped (one line in the output says which
-   backend is in use).
-3. **Rebuild** when you add a GPU toolchain or want to re-detect:
-
-   ```bash
-   ./install_backend.sh                  # re-detect + rebuild
-   ./install_backend.sh --backend vulkan # force one backend
-   ```
-
-Setup also reruns automatically if the installed `llama-cpp-python` version no
-longer matches the one recorded, e.g. after a lock upgrade reinstalls the
-default (CPU) build. `uv sync` itself is safe: uv keeps an installed build whose
-version matches the lock. Run `install_backend.sh -h` for options.
-
-Auto-detection order:
-
-| Platform | Backend | Needs (to build) |
-| --- | --- | --- |
-| macOS, Apple Silicon | `metal` | Xcode command-line tools |
-| NVIDIA GPU (`nvidia-smi`) | `cuda` | CUDA toolkit (`nvcc`) |
-| AMD GPU agent in `rocminfo` | `hip` | ROCm 6.x/7.x (`/opt/rocm/llvm/bin/clang`); gfx targets read from `rocminfo` |
-| Hardware Vulkan device in `vulkaninfo` (e.g. WSL2, iGPUs ROCm doesn't support) | `vulkan` | Vulkan driver + `libvulkan-dev` + `glslc` |
-| anything else (incl. Intel Macs) | `cpu` | — |
-
-A GPU whose toolchain is missing is reported with a hint about what to install,
-and the CPU backend is used. If an auto-detected GPU build fails to compile,
-setup falls back to a CPU build. A failed forced build (`--backend`) stops with
-an error and leaves the previous build in place.
-
-`.backend_setup_complete` looks like:
-
-```
-backend=hip
-llama_cpp_python=0.3.36
-gpu_offload=True
-os=Linux x86_64 (native)
-cpu=AMD Ryzen AI 9 HX 375 w/ Radeon 890M
-gpu=gfx1150
-completed_at=2026-10-02 10:56:34
-```
-
-Device selection when a model loads (`EMBEDDING_DEVICE`):
-
-- `auto` (default) — offload all layers to the GPU when the build supports it.
-  If there's no GPU build, or loading a model on the GPU fails (e.g. out of
-  memory), that model **falls back to CPU** with a warning in the log.
-- `gpu` — the same, but either case is a startup error.
-- `cpu` — never use the GPU.
-
-Notes:
-
-- AMD integrated GPUs such as the Radeon 890M (gfx1150) and 8060S (gfx1151)
-  work with HIP on native Linux with recent ROCm. Under WSL2 the GPU must
-  appear in `rocminfo`; if it doesn't, Vulkan is usually the easier route.
-- On Apple Silicon, GPU and CPU share memory: Qwen at Q4_K_M uses ~6 GB, and
-  Q8_0 (~9–10 GB) wants a 16 GB+ Mac with little else running.
-
----
-
 ## Sample data & Git LFS
 
 `sample_data/eli5_question_answer.jsonl` (~166 MB) is tracked via Git LFS (see
@@ -589,9 +493,9 @@ git lfs install
 git lfs pull
 ```
 
-The model cache (`model_cache/`), generated embeddings (`embedding/`), the
-backend setup marker (`.backend_setup_complete`), and the start script's saved
-settings (`embedding_service.env`) are gitignored. The old
+The model cache (`model_cache/`), generated embeddings (`embedding/`), local
+notes (`docs/`), and the start script's saved settings
+(`embedding_service.env`) are gitignored. The old
 `fastembed_cache/` directory is no longer used and can be deleted.
 
 ---
@@ -601,10 +505,9 @@ settings (`embedding_service.env`) are gitignored. The old
 ```
 .
 ├── src/
-│   ├── models.py                     # MODELS registry (prompts, pooling, GGUF builds)
+│   ├── models.py                     # MODELS registry (prompts, dims, GGUF builds)
 │   ├── server.py                     # FastAPI gateway → llama-server per model
 │   ├── fetch_models.py               # GGUF download for the containers (model-fetch)
-│   ├── embedding_service.py          # EmbeddingService (in-process llama.cpp)
 │   ├── sample_embedding_generator.py # ELI5 QA → Parquet embeddings (per model)
 │   └── cluster_centroid_generator.py # Parquet → K-means centroids (JSONL)
 ├── docker/
@@ -615,7 +518,6 @@ settings (`embedding_service.env`) are gitignored. The old
 ├── docker-compose.yml
 ├── embedding_service.sh              # start | stop | restart | status | logs
 ├── test_embeddings.sh
-├── install_backend.sh
 ├── generate_sample_embeddings.sh
 ├── generate_cluster_centroids.sh
 ├── pyproject.toml
