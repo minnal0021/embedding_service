@@ -12,9 +12,9 @@ For each record it generates one document embedding from the combined
 question and answer, to a Parquet file. The resulting vectors are intended as
 sample data for downstream centroid creation.
 
-Embeddings come from the in-process :class:`EmbeddingService` (PyTorch +
-EmbeddingGemma-300M), so no running HTTP service is required. The service
-applies EmbeddingGemma's document prompt, Matryoshka truncation to the
+Embeddings come from the in-process :class:`EmbeddingService` (llama.cpp) for
+the model named by ``--model``, so no running HTTP service is required. The
+service applies the model's document prompt, Matryoshka truncation to the
 requested ``--dimensions``, and L2-normalisation internally.
 
 Output Parquet schema
@@ -29,12 +29,13 @@ Usage
 
 Options
 -------
+    --model         Model to embed with: gemma | qwen  (required)
     --input         Path to the JSONL file
                     (default: sample_data/eli5_question_answer.jsonl)
     --output        Path to the output Parquet file
-                    (default: embedding/sample_data_embedding.parquet)
-    --dimensions    Embedding width; Matryoshka-truncated from 768
-                    (default: 768; 0 = model native 768)
+                    (default: embedding/<model>/sample_data_embedding.parquet)
+    --dimensions    Embedding width; Matryoshka-truncated from the model's
+                    native width (default: 768; 0 = native, gemma 768 / qwen 4096)
     --batch-size    Number of QA pairs per embedding call
                     (default: 32)
     --max-records   Maximum number of records to process  (0 = all)
@@ -54,7 +55,8 @@ from typing import Iterator
 import pandas as pd
 from tqdm import tqdm
 
-from embedding_service import EmbeddingService
+from embedding_service import DEFAULT_DIMENSIONS as SERVICE_DEFAULT_DIMENSIONS
+from embedding_service import MODELS, EmbeddingService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,8 +68,8 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 DEFAULT_INPUT = "sample_data/eli5_question_answer.jsonl"
-DEFAULT_OUTPUT = "embedding/sample_data_embedding.parquet"
-DEFAULT_DIMENSIONS = 768  # EmbeddingGemma native width; MRL truncates below this
+DEFAULT_OUTPUT = "embedding/{model}/sample_data_embedding.parquet"
+DEFAULT_DIMENSIONS = SERVICE_DEFAULT_DIMENSIONS  # 768; 0 = model native width
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_MAX_RECORDS = 0  # 0 = process all records
 
@@ -156,22 +158,23 @@ class SampleEmbeddingGenerator:
 
     def __init__(
         self,
+        model: str,
         input_path: str = DEFAULT_INPUT,
-        output_path: str = DEFAULT_OUTPUT,
+        output_path: str | None = None,
         dimensions: int = DEFAULT_DIMENSIONS,
         batch_size: int = DEFAULT_BATCH_SIZE,
         max_records: int = DEFAULT_MAX_RECORDS,
-        model_name: str | None = None,
         cache_dir: str | None = None,
+        gguf_file: str | None = None,
     ):
         self.input_path = Path(input_path)
-        self.output_path = Path(output_path)
+        self.output_path = Path(output_path or DEFAULT_OUTPUT.format(model=model))
         # 0 → None means "model native width" (no truncation).
         self.dimensions = dimensions or None
         self.batch_size = batch_size
         self.max_records = max_records
         self.service = EmbeddingService(
-            model_name=model_name, cache_dir=cache_dir
+            model, cache_dir=cache_dir, gguf_file=gguf_file
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -204,9 +207,13 @@ class SampleEmbeddingGenerator:
 
     def run(self) -> Path:
         """Execute the full pipeline and return the output Parquet path."""
+        logger.info("Model        : %s (%s)", self.service.key, self.service.gguf_file)
         logger.info("Input file   : %s", self.input_path)
         logger.info("Output file  : %s", self.output_path)
-        logger.info("Dimensions   : %s", self.dimensions or "native (768)")
+        logger.info(
+            "Dimensions   : %s",
+            self.dimensions or f"native ({self.service.dimension})",
+        )
         logger.info("Batch size   : %d", self.batch_size)
         logger.info(
             "Max records  : %s", self.max_records if self.max_records else "all"
@@ -295,20 +302,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Generate sample QA embeddings and write to Parquet (for centroid creation).",
     )
     p.add_argument(
+        "--model",
+        required=True,
+        choices=list(MODELS),
+        help="Model to embed with",
+    )
+    p.add_argument(
         "--input",
         default=DEFAULT_INPUT,
         help=f"JSONL input file (default: {DEFAULT_INPUT})",
     )
     p.add_argument(
         "--output",
-        default=DEFAULT_OUTPUT,
+        default=None,
         help=f"Output Parquet path (default: {DEFAULT_OUTPUT})",
     )
     p.add_argument(
         "--dimensions",
         type=int,
         default=DEFAULT_DIMENSIONS,
-        help=f"Embedding dimensions, 0 = native 768 (default: {DEFAULT_DIMENSIONS})",
+        help=f"Embedding dimensions, 0 = model native (default: {DEFAULT_DIMENSIONS})",
     )
     p.add_argument(
         "--batch-size",
@@ -329,6 +342,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     generator = SampleEmbeddingGenerator(
+        model=args.model,
         input_path=args.input,
         output_path=args.output,
         dimensions=args.dimensions,

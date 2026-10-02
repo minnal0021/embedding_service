@@ -1,0 +1,6 @@
+# Only pyproject.toml, uv.lock and src/ go into the gateway image.
+*
+!pyproject.toml
+!uv.lock
+!src/
+src/**/__pycache__

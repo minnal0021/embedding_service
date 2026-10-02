@@ -1,189 +1,172 @@
 import os
+import sys
 
+import llama_cpp
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
+from huggingface_hub import hf_hub_download
+
+from models import DEFAULT_DIMENSIONS, MODELS, parse_model_keys
+from models import gguf_file as default_gguf_file
+
+
+# llama-cpp-python pooling constants for ModelSpec.pooling.
+POOLING = {
+    "mean": llama_cpp.LLAMA_POOLING_TYPE_MEAN,
+    "last": llama_cpp.LLAMA_POOLING_TYPE_LAST,
+}
 
 
 class EmbeddingService:
-    """Generate text embeddings with EmbeddingGemma-300M on PyTorch.
+    """Generate text embeddings for one model in `MODELS` via llama.cpp.
 
-    The model runs through sentence-transformers, which applies EmbeddingGemma's
-    full pipeline: transformer → mean pooling → two Dense projections
-    (768 → 3072 → 768) → L2 normalisation. (The previous FastEmbed/ONNX runtime
-    mean-pooled the raw hidden states and skipped both projections, so its
-    vectors were not EmbeddingGemma's trained embeddings.)
+    The GGUF build is fetched from Hugging Face into the cache dir on first
+    use. Documents and queries are embedded asymmetrically by way of each
+    model's task-specific prompt prefixes. Both models support Matryoshka
+    representation, so vectors are sliced to `dimensions` (DEFAULT_DIMENSIONS
+    unless given; None = the model's native width) and re-normalised.
 
-    The model embeds documents and queries asymmetrically by way of
-    task-specific prompt prefixes, which we apply ourselves. EmbeddingGemma
-    supports Matryoshka representation, so callers may request a truncated
-    `dimensions`; vectors are sliced and re-normalised.
-
-    Inference runs on an AMD GPU when PyTorch's ROCm build finds a supported one
-    (natively through HIP, in bfloat16), otherwise on the CPU (float32).
-    `device` (or the EMBEDDING_DEVICE env var) overrides this: "auto" (default),
-    "gpu", "cpu".
+    The GPU backend (Metal on macOS, HIP/ROCm or Vulkan on AMD) is fixed when
+    llama-cpp-python is built (see install_backend.sh), so device selection
+    only decides whether to offload layers to whatever backend is compiled in.
     """
 
-    # Ungated mirror of google/embeddinggemma-300m. The official repo is gated
-    # (Gemma licence + Hugging Face token); point EMBEDDING_MODEL at it once a
-    # token is configured.
-    DEFAULT_MODEL_NAME = "unsloth/embeddinggemma-300m"
-    DEFAULT_CACHE_DIR = "/app/model_cache"
-    # Native (untruncated) embedding width of the model.
-    FULL_DIMENSION = 768
-
-    # EmbeddingGemma's documented task prompts (from the model card).
-    QUERY_PROMPT = "task: search result | query: "
-    DOCUMENT_PROMPT = "title: none | text: "
-
-    DEVICES = ("auto", "gpu", "cpu")
-    # EmbeddingGemma does not support float16 (activations overflow); the model
-    # card recommends bfloat16 or float32.
-    DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
-
-    # Texts per forward pass. 32 measured fastest on a Radeon AI PRO R9700:
-    # larger batches mix whole documents with short chunks and waste compute on
-    # padding. Override with EMBEDDING_BATCH_SIZE.
-    GPU_BATCH_SIZE = 32
-    CPU_BATCH_SIZE = 16
+    DEFAULT_CACHE_DIR = "./model_cache"
 
     def __init__(
         self,
-        model_name: str | None = None,
+        model_key: str,
         cache_dir: str | None = None,
+        gguf_file: str | None = None,
         device: str | None = None,
-        dtype: str | None = None,
     ):
-        self.model_name = model_name or os.getenv(
-            "EMBEDDING_MODEL", self.DEFAULT_MODEL_NAME
-        )
+        if model_key not in MODELS:
+            raise ValueError(
+                f"Unknown model {model_key!r}; available: {', '.join(MODELS)}"
+            )
+        self.key = model_key
+        self.spec = MODELS[model_key]
+        self.model_name = self.spec.name
+        self.dimension = self.spec.dimension
         self.cache_dir = cache_dir or os.getenv(
             "EMBEDDING_CACHE_PATH", self.DEFAULT_CACHE_DIR
         )
+        # Defaults to the model's build in MODELS; override per model (e.g. a
+        # different quantization) via arg or the model's EMBEDDING_<MODEL>_GGUF.
+        self.gguf_file = gguf_file or default_gguf_file(self.spec)
 
-        requested = (device or os.getenv("EMBEDDING_DEVICE", "auto")).lower()
-        if requested not in self.DEVICES:
-            raise ValueError(f"device must be one of {self.DEVICES}, got {requested!r}")
-        torch_device = self._select_device(requested)
-        self.device = "cpu" if torch_device == "cpu" else "gpu"
+        # "auto" uses the GPU when llama.cpp was built with one and falls back
+        # to the CPU otherwise (or if loading on it fails); "gpu" requires it;
+        # "cpu" never uses it. Override via EMBEDDING_DEVICE.
+        device = (device or os.getenv("EMBEDDING_DEVICE", "auto")).lower()
+        if device not in ("auto", "gpu", "cpu"):
+            raise ValueError(
+                f"EMBEDDING_DEVICE must be auto, gpu or cpu (got {device!r})"
+            )
 
-        dtype_name = (
-            dtype
-            or os.getenv("EMBEDDING_DTYPE")
-            or ("bfloat16" if self.device == "gpu" else "float32")
-        ).lower()
-        if dtype_name not in self.DTYPES:
-            raise ValueError(f"dtype must be one of {tuple(self.DTYPES)}, got {dtype_name!r}")
-        self.dtype = dtype_name
-
-        batch_override = os.getenv("EMBEDDING_BATCH_SIZE")
-        if batch_override:
-            self.batch_size = int(batch_override)
-        else:
-            self.batch_size = self.GPU_BATCH_SIZE if self.device == "gpu" else self.CPU_BATCH_SIZE
-
-        print(f"Loading {self.model_name} from {self.cache_dir}...")
-        self.model = SentenceTransformer(
-            self.model_name,
-            device=torch_device,
-            cache_folder=self.cache_dir,
-            model_kwargs={"torch_dtype": self.DTYPES[dtype_name]},
+        model_path = hf_hub_download(
+            repo_id=self.spec.repo, filename=self.gguf_file, cache_dir=self.cache_dir
         )
-        max_len = os.getenv("EMBEDDING_MAX_SEQ_LENGTH")
-        if max_len:
-            self.model.max_seq_length = int(max_len)
-        # Warm up so the first request doesn't pay kernel selection/compilation.
-        self.model.encode(["warmup"], batch_size=1)
+        self.llm, self.device = self._load(model_path, device)
+        self.backend = gpu_backend() if self.device == "gpu" else "cpu"
+        print(f"Loaded {self.key} ({self.gguf_file}) on {self.device} ({self.backend})")
 
-        gpu = f" [{torch.cuda.get_device_name(torch_device)}]" if self.device == "gpu" else ""
-        print(
-            f"Embedding device: {self.device} ({torch_device}{gpu}), dtype {self.dtype}, "
-            f"batch size {self.batch_size}, max_seq_length {self.model.max_seq_length}"
+    def _load(self, model_path: str, device: str) -> tuple[llama_cpp.Llama, str]:
+        """Load the GGUF, offloading to the GPU when requested and available."""
+        gpu_ok = llama_cpp.llama_supports_gpu_offload()
+        if device == "gpu" and not gpu_ok:
+            raise RuntimeError(
+                "EMBEDDING_DEVICE=gpu but llama-cpp-python was built without "
+                "GPU support. Rebuild it with ./install_backend.sh; see README."
+            )
+        if device == "cpu" or not gpu_ok:
+            return self._llama(model_path, n_gpu_layers=0), "cpu"
+
+        print(f"Loading {self.key} from {model_path} on gpu ({gpu_backend()})...")
+        try:
+            return self._llama(model_path, n_gpu_layers=-1), "gpu"
+        except Exception as e:  # noqa: BLE001 — e.g. out of GPU memory
+            if device == "gpu":
+                raise
+            print(
+                f"WARNING: loading {self.key} on the GPU failed ({e}); "
+                "falling back to CPU.",
+                file=sys.stderr,
+            )
+        return self._llama(model_path, n_gpu_layers=0), "cpu"
+
+    def _llama(self, model_path: str, n_gpu_layers: int) -> llama_cpp.Llama:
+        n_ctx = self.spec.n_ctx
+        return llama_cpp.Llama(
+            model_path=model_path,
+            embedding=True,
+            pooling_type=POOLING[self.spec.pooling],
+            n_ctx=n_ctx,
+            n_batch=n_ctx,
+            n_ubatch=n_ctx,
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,
         )
-
-    @staticmethod
-    def _select_device(requested: str) -> str:
-        """Pick the torch device for `requested` ("auto" | "gpu" | "cpu").
-
-        Among the GPUs PyTorch can see, only those whose architecture this torch
-        build ships kernels for are usable (e.g. an integrated Radeon next to a
-        discrete card may not be); of those, the one with the most compute units
-        wins. EMBEDDING_GPU_INDEX pins a specific GPU instead.
-        """
-        if requested == "cpu":
-            return "cpu"
-        candidates: list[tuple[int, int]] = []
-        if torch.cuda.is_available():
-            supported = set(torch.cuda.get_arch_list())
-            for i in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(i)
-                arch = getattr(props, "gcnArchName", "").split(":")[0]
-                if not supported or arch in supported:
-                    candidates.append((props.multi_processor_count, i))
-        pinned = os.getenv("EMBEDDING_GPU_INDEX")
-        if pinned is not None:
-            index = int(pinned)
-            if index not in [i for _, i in candidates]:
-                raise RuntimeError(f"EMBEDDING_GPU_INDEX={index} is not a usable GPU")
-            return f"cuda:{index}"
-        if candidates:
-            return f"cuda:{max(candidates)[1]}"
-        if requested == "gpu":
-            raise RuntimeError("GPU requested but PyTorch found no supported GPU")
-        return "cpu"
 
     def embed_documents(
-        self, payloads: list[str], dimensions: int | None = None
+        self, payloads: list[str], dimensions: int | None = DEFAULT_DIMENSIONS
     ) -> list[list[float]]:
         """Embed payloads as documents (for indexing)."""
-        return self.finalize(self.encode_texts(self.prompt_documents(payloads)), dimensions)
+        prompted = [self.spec.document_prompt + p for p in payloads]
+        return self._embed(self.llm.embed(prompted, normalize=False), dimensions)
 
     def embed_query(
-        self, payloads: list[str], dimensions: int | None = None
+        self, payloads: list[str], dimensions: int | None = DEFAULT_DIMENSIONS
     ) -> list[list[float]]:
         """Embed payloads as search queries."""
-        return self.finalize(self.encode_texts(self.prompt_queries(payloads)), dimensions)
+        prompted = [self.spec.query_prompt + p for p in payloads]
+        return self._embed(self.llm.embed(prompted, normalize=False), dimensions)
 
-    # The three steps below are public so the HTTP server can batch across
-    # requests: prompt each request's payloads, encode every request's texts in
-    # one call, then finalize each request's slice at its own `dimensions`.
+    def _embed(self, vectors, dimensions: int | None) -> list[list[float]]:
+        """Truncate (Matryoshka) + L2-normalise pooled vectors to lists.
 
-    def prompt_documents(self, payloads: list[str]) -> list[str]:
-        """Apply EmbeddingGemma's document task prompt."""
-        return [self.DOCUMENT_PROMPT + p for p in payloads]
-
-    def prompt_queries(self, payloads: list[str]) -> list[str]:
-        """Apply EmbeddingGemma's query task prompt."""
-        return [self.QUERY_PROMPT + p for p in payloads]
-
-    def encode_texts(self, texts: list[str]) -> np.ndarray:
-        """Embed already-prompted `texts` at full width, as a float32 array.
-
-        Order is preserved: `encode` returns vectors in input order (it sorts
-        by length internally to minimise padding, then restores the order).
+        Order is preserved: vectors are emitted in the same order the model
+        yields them, which matches the input payload order.
         """
-        return self.model.encode(
-            texts,
-            batch_size=self.batch_size,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        ).astype(np.float32)
+        out: list[list[float]] = []
+        for vector in vectors:
+            vec = np.asarray(vector, dtype=np.float32)
+            if dimensions is not None and dimensions < vec.shape[0]:
+                # Matryoshka truncation; renormalise the shortened vector below.
+                vec = vec[:dimensions]
+            # Always return L2-normalised vectors.
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            out.append(vec.tolist())
+        return out
 
-    @staticmethod
-    def finalize(vectors: np.ndarray, dimensions: int | None) -> list[list[float]]:
-        """Matryoshka-truncate `vectors` to `dimensions` and L2-normalise."""
-        if dimensions is not None and dimensions < vectors.shape[1]:
-            vectors = vectors[:, :dimensions]
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        vectors = np.divide(vectors, norms, out=np.zeros_like(vectors), where=norms > 0)
-        return vectors.tolist()
+
+def gpu_backend() -> str:
+    """Name the GPU backend llama-cpp-python was compiled with, if any."""
+    if not llama_cpp.llama_supports_gpu_offload():
+        return "cpu"
+    info = llama_cpp.llama_print_system_info().decode()
+    for marker, name in (
+        ("Metal", "metal"),
+        ("ROCm", "hip"),
+        ("HIP", "hip"),
+        ("Vulkan", "vulkan"),
+        ("CUDA", "cuda"),
+    ):
+        if marker in info:
+            return name
+    return "gpu"
+
+
+def load_models(keys: list[str], **kwargs) -> dict[str, EmbeddingService]:
+    """Load each named model (validated up front so a typo fails fast)."""
+    return {k: EmbeddingService(k, **kwargs) for k in parse_model_keys(keys)}
 
 
 def main() -> None:
-    service = EmbeddingService()
+    service = EmbeddingService(sys.argv[1] if len(sys.argv) > 1 else "gemma")
     sample_texts = [
-        "Sentence-transformers runs EmbeddingGemma's full pipeline.",
+        "llama.cpp makes embedding generation fast and portable.",
         "EmbeddingGemma is a compact text embedding model.",
     ]
     embeddings = service.embed_documents(sample_texts, dimensions=256)
