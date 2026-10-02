@@ -4,7 +4,7 @@ set -euo pipefail
 # Test the batch embedding service.
 # For each model, tests /embedding/{model}/query and /embedding/{model}/document
 # and verifies Matryoshka dimension truncation. Also checks that unknown model
-# names (and the old model-less paths) return 404.
+# names and paths without a model return 404.
 #
 # Usage:
 #   ./test_embeddings.sh [MODEL]
@@ -160,9 +160,9 @@ while read -r m dim def; do
     test_model "${m}" "${dim}" "${def}"
 done <<<"${SELECTED}"
 
-# ── Unknown model / legacy paths ─────────────────────────────────────
+# ── Unknown model / no model ─────────────────────────────────────────
 echo "════════════════════════════════════════════════════════════════"
-echo "── Test: Unknown model and legacy paths return 404 ──"
+echo "── Test: Unknown model and paths without a model return 404 ──"
 expect_404 "/embedding/bogus/query"
 expect_404 "/embedding/bogus/document"
 expect_404 "/embedding/query"
