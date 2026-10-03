@@ -17,6 +17,15 @@ The models themselves run in llama.cpp's `llama-server`, one per model (see
 docker-compose.yml). This gateway adds each model's prompt prefix, forwards the
 texts to that model's server, then truncates and L2-normalises the vectors.
 
+Inputs longer than the model's context are truncated, not refused. llama-server
+rejects a sequence longer than its context (`-c`; gemma's native 2048, qwen's
+8192 here), which would fail the whole request. When a call fails that way, the
+gateway tokenizes the texts with llama-server, keeps each one's first tokens up
+to the context (keeping the model's special start and end tokens, which gemma
+and qwen pool over), and embeds the token IDs instead. Texts that fit are
+unaffected, and each truncation is logged. This matches sentence-transformers,
+which also cuts input at the model's maximum length.
+
 Requests are batched **across** clients, per model: every request's payloads
 go onto that model's queue, and a single worker sends one llama-server call
 for everything queued (document and query texts alike, since each already
@@ -107,6 +116,9 @@ class DynamicBatcher:
         self.max_texts = max_texts
         self.max_wait_s = max_wait_s
         self.queue: asyncio.Queue[_Job] = asyncio.Queue()
+        # (context length, special tokens before the text, after it); fetched
+        # from llama-server on the first input that needs truncating.
+        self._context: tuple[int, list[int], list[int]] | None = None
 
     async def submit(self, texts: list[str], dimensions: int) -> list[list[float]]:
         future = asyncio.get_running_loop().create_future()
@@ -168,14 +180,13 @@ class DynamicBatcher:
         return results
 
     async def _embed(self, client: httpx.AsyncClient, texts: list[str]) -> np.ndarray:
-        """Embed already-prompted `texts` at full width, in input order."""
-        body = {"input": texts, "encoding_format": "float"}
-        try:
-            r = await client.post(f"{self.server.url}/v1/embeddings", json=body)
-        except httpx.HTTPError as e:
-            raise ModelServerError(
-                503, f"{self.server.key} model server unavailable: {e!r}"
-            )
+        """Embed already-prompted `texts` at full width, in input order.
+
+        If llama-server refuses an input as longer than its context, embed the
+        texts again as token IDs, with the long ones truncated to fit."""
+        r = await self._post_embeddings(client, texts)
+        if r.status_code != 200 and _too_long(r):
+            r = await self._post_embeddings(client, await self._truncated_tokens(client, texts))
         if r.status_code != 200:
             # 503 = still loading; anything else (e.g. an input longer than the
             # context) is a model error, surfaced as a 500.
@@ -185,6 +196,83 @@ class DynamicBatcher:
             )
         data = sorted(r.json()["data"], key=lambda d: d["index"])
         return np.asarray([d["embedding"] for d in data], dtype=np.float32)
+
+    async def _post_embeddings(
+        self, client: httpx.AsyncClient, inputs: list[str] | list[list[int]]
+    ) -> httpx.Response:
+        body = {"input": inputs, "encoding_format": "float"}
+        try:
+            return await client.post(f"{self.server.url}/v1/embeddings", json=body)
+        except httpx.HTTPError as e:
+            raise ModelServerError(
+                503, f"{self.server.key} model server unavailable: {e!r}"
+            )
+
+    async def _truncated_tokens(
+        self, client: httpx.AsyncClient, texts: list[str]
+    ) -> list[list[int]]:
+        """Each text as the token IDs llama-server would embed for it, cut to
+        the model's context. Embedding the token IDs of a text that fits gives
+        the same vector as embedding the text."""
+        n_ctx, prefix, suffix = await self._context_info(client)
+        # One under the context: a model with a KV cache (qwen) refuses a
+        # request of exactly n_ctx tokens.
+        limit = n_ctx - 1
+        tokens = await asyncio.gather(*(self._tokenize(client, t, True) for t in texts))
+        out = []
+        for i, toks in enumerate(tokens):
+            cut = truncate_tokens(toks, limit, prefix, suffix)
+            if len(cut) < len(toks):
+                logger.warning("%s: input %d of %d has %d tokens; truncated to %d for the %d-token context",
+                               self.server.key, i + 1, len(texts), len(toks), limit, n_ctx)
+            out.append(cut)
+        return out
+
+    async def _context_info(self, client: httpx.AsyncClient) -> tuple[int, list[int], list[int]]:
+        """The per-sequence context and the special tokens the model's
+        tokenizer adds before and after a text, fetched once."""
+        if self._context is None:
+            r = await client.get(f"{self.server.url}/props")
+            r.raise_for_status()
+            n_ctx = int(r.json()["default_generation_settings"]["n_ctx"])
+            plain = await self._tokenize(client, "a", False)
+            special = await self._tokenize(client, "a", True)
+            start = next(
+                (i for i in range(len(special)) if special[i : i + len(plain)] == plain), None
+            )
+            if start is None:
+                raise ModelServerError(
+                    500, f"{self.server.key}: cannot locate the text within its special tokens"
+                )
+            self._context = (n_ctx, special[:start], special[start + len(plain) :])
+        return self._context
+
+    async def _tokenize(self, client: httpx.AsyncClient, text: str, add_special: bool) -> list[int]:
+        try:
+            r = await client.post(
+                f"{self.server.url}/tokenize", json={"content": text, "add_special": add_special}
+            )
+        except httpx.HTTPError as e:
+            raise ModelServerError(
+                503, f"{self.server.key} model server unavailable: {e!r}"
+            )
+        if r.status_code != 200:
+            raise ModelServerError(500, f"{self.server.key}: tokenize failed: {_error_message(r)}")
+        return r.json()["tokens"]
+
+
+def truncate_tokens(tokens: list[int], n_ctx: int, prefix: list[int], suffix: list[int]) -> list[int]:
+    """Cut `tokens` (a text's tokens wrapped in the model's special `prefix`
+    and `suffix`) to at most `n_ctx`, keeping the special tokens and the start
+    of the text. Tokens that already fit are returned unchanged."""
+    if len(tokens) <= n_ctx:
+        return tokens
+    has_prefix = tokens[: len(prefix)] == prefix
+    has_suffix = bool(suffix) and tokens[-len(suffix) :] == suffix
+    head = prefix if has_prefix else []
+    tail = suffix if has_suffix else []
+    body = tokens[len(head) : len(tokens) - len(tail)]
+    return head + body[: max(0, n_ctx - len(head) - len(tail))] + tail
 
 
 BATCHERS = {
@@ -303,6 +391,20 @@ def _finalize(vectors: np.ndarray, dimensions: int) -> list[list[float]]:
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     vectors = np.divide(vectors, norms, out=np.zeros_like(vectors), where=norms > 0)
     return vectors.tolist()
+
+
+def _too_long(r: httpx.Response) -> bool:
+    """Whether llama-server refused an input as longer than its context.
+
+    It says so two ways: a model without a KV cache (gemma) fails on the batch
+    size, "input (N tokens) is too large to process"; one with a KV cache
+    (qwen) is stopped earlier with a 400 `exceed_context_size_error`."""
+    try:
+        if r.json()["error"]["type"] == "exceed_context_size_error":
+            return True
+    except Exception:  # noqa: BLE001 — not llama-server's JSON error shape
+        pass
+    return "too large to process" in _error_message(r)
 
 
 def _error_message(r: httpx.Response) -> str:

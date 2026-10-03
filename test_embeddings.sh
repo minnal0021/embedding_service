@@ -3,7 +3,8 @@ set -euo pipefail
 #
 # Test the batch embedding service.
 # For each model, tests /embedding/{model}/query and /embedding/{model}/document
-# and verifies Matryoshka dimension truncation. Also checks that unknown model
+# verifies Matryoshka dimension truncation, and checks that an input longer
+# than the model's context is truncated, not rejected. Also checks that unknown model
 # names and paths without a model return 404.
 #
 # Usage:
@@ -153,6 +154,13 @@ test_model() {
     # Matryoshka truncation lets callers request a smaller width.
     echo "── Test 4: Dimension Truncation (${native} → 256) ──"
     post_and_check "${base}/query" '{"payloads": ["What is machine learning?"], "dimensions": 256}' 256
+    echo ""
+
+    # Longer than either model's context (2048 / 8192 tokens): truncated, not rejected.
+    echo "── Test 5: Input Longer Than the Context ──"
+    local long_body
+    long_body="$(python3 -c "import json; print(json.dumps({'payloads': ['Interest rates and bond yields move together. ' * 1500, 'short text']}))")"
+    post_and_check "${base}/document" "${long_body}" "${default}"
     echo ""
 }
 
