@@ -249,13 +249,20 @@ differently.
 Each vector is exactly `min(dimensions, native)` long and L2-normalised. An
 empty `payloads` list returns `{"embeddings": []}` without calling the model.
 
+**Long inputs are truncated.** A payload longer than the model's context (2048
+tokens for `gemma`, 8192 for `qwen`, counting the task prompt) is embedded from
+its first tokens, up to one token under the context, keeping the model's own
+start and end tokens. Payloads that fit are embedded exactly as before, and
+each truncation is logged as a warning. sentence-transformers truncates the
+same way.
+
 **Errors**
 
 | Status | When |
 |---|---|
 | 404 | Unknown model, or a model the service was not started with |
 | 422 | Malformed request (e.g. `dimensions` < 1) |
-| 500 | The model server rejected the input (e.g. a text longer than the model's context); the message is llama.cpp's |
+| 500 | The model server rejected the input; the message is llama.cpp's. Inputs longer than the context are truncated, not rejected |
 | 503 | The model server is down or still loading |
 
 **Example**
@@ -352,8 +359,9 @@ uv run python src/sample_embedding_generator.py \
 - `--service-url` (or `SERVICE_URL`, default `http://localhost:8001`) points it
   at the service, which may run on another machine. It checks that the model is
   loaded and ready before starting.
-- A batch the service rejects (e.g. a record longer than the model's context)
-  is retried one record at a time, and only the failing records are skipped.
+- A batch the service rejects is retried one record at a time, and only the
+  failing records are skipped. (Records longer than the model's context are
+  truncated by the service, not rejected.)
 - The shell script reads `DIMENSIONS`, `BATCH_SIZE`, `MAX_RECORDS` (default
   25000) and `SERVICE_URL` from the environment.
 
@@ -560,6 +568,8 @@ are gitignored.
 │   └── eli5_question_answer.jsonl    # sample QA pairs (Git LFS)
 ├── docker-compose.yml
 ├── embedding_service.sh              # start | stop | restart | status | logs
+├── tests/
+│   └── test_truncate.py              # unit tests: python -m unittest discover tests
 ├── test_embeddings.sh
 ├── generate_sample_embeddings.sh
 ├── generate_cluster_centroids.sh
