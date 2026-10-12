@@ -26,13 +26,20 @@ and qwen pool over), and embeds the token IDs instead. Texts that fit are
 unaffected, and each truncation is logged. This matches sentence-transformers,
 which also cuts input at the model's maximum length.
 
-Requests are batched **across** clients, per model: every request's payloads
-go onto that model's queue, and a single worker sends one llama-server call
-for everything queued (document and query texts alike, since each already
-carries its task prompt), then splits the vectors back per request. Clients
-typically send one small request per document (~5 texts), so this is what
-fills the GPU; llama-server then runs the texts of a call in parallel across
-its slots (`-np` in docker-compose.yml).
+Requests are batched **across** clients, per model and per task: each model
+has a document lane and a query lane, each with its own queue and worker. A
+worker sends one llama-server call for everything queued in its lane, then
+splits the vectors back per request. Clients typically send one small request
+per document (~5 texts), so this is what fills the GPU; llama-server then runs
+the texts of a call in parallel across its slots (`-np` in docker-compose.yml).
+
+The lanes keep searches fast while documents are being indexed. A query never
+waits for a document batch in the gateway, since the two lanes call
+llama-server concurrently. llama-server itself runs the texts it is sent first
+come, first served, so the document lane sends its batch in chunks of
+EMBEDDING_DOCUMENT_CHUNK_TEXTS texts, at most two at a time: a query's texts
+then queue behind at most two chunks, not a whole 256-text batch, while the
+second chunk keeps the slots busy between calls.
 
 Environment:
     EMBEDDING_MODELS          models to serve (default: gemma,qwen)
@@ -47,6 +54,10 @@ Environment:
                               after taking the backlog (default 2). An idle
                               worker sends the first request immediately, so a
                               lone request never pays the wait.
+    EMBEDDING_DOCUMENT_CHUNK_TEXTS
+                              texts per llama-server call in the document lane
+                              (default 8); bounds how long a query can wait
+                              behind documents
 """
 
 import asyncio
@@ -108,13 +119,32 @@ class _Job:
     future: asyncio.Future
 
 
-class DynamicBatcher:
-    """Coalesce concurrent requests for one model into shared llama-server calls."""
+# Document chunks a lane has at llama-server at once: two, so the next chunk
+# is already queued when one finishes and the slots never wait on the gateway.
+CHUNKS_IN_FLIGHT = 2
 
-    def __init__(self, server: LlamaServer, max_texts: int, max_wait_s: float):
+
+class DynamicBatcher:
+    """Coalesce concurrent requests for one model and task (one lane) into
+    shared llama-server calls.
+
+    `chunk_texts`, if set, splits each batch into calls of at most that many
+    texts, `CHUNKS_IN_FLIGHT` at a time, so another lane's call to the same
+    llama-server queues behind at most that many texts."""
+
+    def __init__(
+        self,
+        server: LlamaServer,
+        lane: str,
+        max_texts: int,
+        max_wait_s: float,
+        chunk_texts: int | None = None,
+    ):
         self.server = server
+        self.name = f"{server.key}/{lane}"
         self.max_texts = max_texts
         self.max_wait_s = max_wait_s
+        self.chunk_texts = chunk_texts
         self.queue: asyncio.Queue[_Job] = asyncio.Queue()
         # (context length, special tokens before the text, after it); fetched
         # from llama-server on the first input that needs truncating.
@@ -165,11 +195,11 @@ class DynamicBatcher:
         """Embed all jobs' texts in one call; on failure, retry each job alone
         so one bad request cannot fail the others sharing its batch."""
         try:
-            vectors = await self._embed(client, [t for job in jobs for t in job.texts])
+            vectors = await self._embed_chunked(client, [t for job in jobs for t in job.texts])
         except Exception as e:  # noqa: BLE001 — isolate the failing request below
             if len(jobs) == 1:
                 logger.warning("%s: embedding %d texts failed: %s",
-                               self.server.key, len(jobs[0].texts), e)
+                               self.name, len(jobs[0].texts), e)
                 return [e]
             return [r for job in jobs for r in await self._process(client, [job])]
         results, offset = [], 0
@@ -178,6 +208,28 @@ class DynamicBatcher:
             offset += len(job.texts)
             results.append(_finalize(part, job.dimensions))
         return results
+
+    async def _embed_chunked(self, client: httpx.AsyncClient, texts: list[str]) -> np.ndarray:
+        """`_embed`, in calls of at most `chunk_texts` texts with at most
+        `CHUNKS_IN_FLIGHT` sent at once. The semaphore wakes waiters in order,
+        so chunks reach llama-server in input order."""
+        size = self.chunk_texts
+        if not size or len(texts) <= size:
+            return await self._embed(client, texts)
+        in_flight = asyncio.Semaphore(CHUNKS_IN_FLIGHT)
+
+        async def chunk(part: list[str]) -> np.ndarray:
+            async with in_flight:
+                return await self._embed(client, part)
+
+        # A TaskGroup cancels the remaining chunks as soon as one fails; raise
+        # that chunk's error itself, so a 503 stays a 503.
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [tg.create_task(chunk(texts[i : i + size])) for i in range(0, len(texts), size)]
+        except ExceptionGroup as eg:
+            raise eg.exceptions[0]
+        return np.concatenate([t.result() for t in tasks])
 
     async def _embed(self, client: httpx.AsyncClient, texts: list[str]) -> np.ndarray:
         """Embed already-prompted `texts` at full width, in input order.
@@ -275,24 +327,33 @@ def truncate_tokens(tokens: list[int], n_ctx: int, prefix: list[int], suffix: li
     return head + body[: max(0, n_ctx - len(head) - len(tail))] + tail
 
 
+MAX_BATCH_TEXTS = int(os.getenv("EMBEDDING_MAX_BATCH_TEXTS", "256"))
+BATCH_WAIT_S = float(os.getenv("EMBEDDING_BATCH_WAIT_MS", "2")) / 1000
+DOCUMENT_CHUNK_TEXTS = int(os.getenv("EMBEDDING_DOCUMENT_CHUNK_TEXTS", "8"))
+
+# Two lanes per model, so a query never waits for a document batch. Only the
+# document lane is chunked; queries are short and few, so sent whole.
 BATCHERS = {
-    key: DynamicBatcher(
-        server,
-        max_texts=int(os.getenv("EMBEDDING_MAX_BATCH_TEXTS", "256")),
-        max_wait_s=float(os.getenv("EMBEDDING_BATCH_WAIT_MS", "2")) / 1000,
-    )
+    key: {
+        "document": DynamicBatcher(
+            server, "document", MAX_BATCH_TEXTS, BATCH_WAIT_S, chunk_texts=DOCUMENT_CHUNK_TEXTS
+        ),
+        "query": DynamicBatcher(server, "query", MAX_BATCH_TEXTS, BATCH_WAIT_S),
+    }
     for key, server in SERVERS.items()
 }
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One pooled client for all llama-servers, plus one batch worker per model.
+    # One pooled client for all llama-servers, plus one batch worker per lane.
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=5)
     ) as client:
         app.state.client = client
-        workers = [asyncio.create_task(b.run(client)) for b in BATCHERS.values()]
+        workers = [
+            asyncio.create_task(b.run(client)) for lanes in BATCHERS.values() for b in lanes.values()
+        ]
         try:
             yield
         finally:
@@ -316,13 +377,13 @@ class BatchEmbedResponse(BaseModel):
 @app.post("/embedding/{model}/document", response_model=BatchEmbedResponse)
 async def embed_document(model: str, request: BatchEmbedRequest) -> BatchEmbedResponse:
     server = _server(model)
-    return await _embed(server, server.spec.document_prompt, request)
+    return await _embed(server, "document", server.spec.document_prompt, request)
 
 
 @app.post("/embedding/{model}/query", response_model=BatchEmbedResponse)
 async def embed_query(model: str, request: BatchEmbedRequest) -> BatchEmbedResponse:
     server = _server(model)
-    return await _embed(server, server.spec.query_prompt, request)
+    return await _embed(server, "query", server.spec.query_prompt, request)
 
 
 @app.get("/healthcheck")
@@ -369,7 +430,7 @@ async def _llama_status(server: LlamaServer) -> str:
 
 
 async def _embed(
-    server: LlamaServer, prompt: str, request: BatchEmbedRequest
+    server: LlamaServer, lane: str, prompt: str, request: BatchEmbedRequest
 ) -> BatchEmbedResponse:
     # Empty payloads short-circuit to an empty result (the Rust client never
     # posts these, but mirror its no-op semantics rather than erroring).
@@ -377,7 +438,7 @@ async def _embed(
         return BatchEmbedResponse(embeddings=[])
     texts = [prompt + p for p in request.payloads]
     try:
-        embeddings = await BATCHERS[server.key].submit(texts, request.dimensions)
+        embeddings = await BATCHERS[server.key][lane].submit(texts, request.dimensions)
     except ModelServerError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:  # noqa: BLE001 — surface model errors as 500s
