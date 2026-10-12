@@ -121,13 +121,20 @@ The service runs as four containers:
 
 Clients such as minnal send one small request per document (the whole text
 plus ~4 chunks, about 5 texts). Each model call has a fixed cost, so the
-gateway batches **across** requests, per model:
+gateway batches **across** requests, per model and per task:
 
-1. Every request goes onto its model's queue.
-2. A single worker per model sends one `llama-server` call for everything
-   queued, document and query texts together (each already carries its prompt).
+1. Every request goes onto its model's document or query queue (its *lane*).
+2. A worker per lane sends one `llama-server` call for everything queued in
+   that lane.
 3. It splits the vectors back per request and applies each request's own
    `dimensions`.
+
+The two lanes call `llama-server` concurrently, so a search query never waits
+for a document batch to finish. `llama-server` runs the texts it receives in
+arrival order, so the document lane also sends its batch in chunks of
+`EMBEDDING_DOCUMENT_CHUNK_TEXTS` (8) texts, at most two chunks at a time: a
+query then waits behind at most 16 document texts, while the second chunk
+keeps the GPU busy between calls. Queries are sent whole.
 
 If a shared call fails, each request in it is retried alone, so one bad request
 cannot fail its neighbours. An idle worker sends a lone request immediately; a
@@ -435,13 +442,14 @@ option is not given.
 | `STARTUP_TIMEOUT` | `1800` | Seconds the start script waits for the models to load. |
 | `EMBEDDING_MAX_BATCH_TEXTS` | `256` | Max texts per model call when the gateway batches concurrent requests. |
 | `EMBEDDING_BATCH_WAIT_MS` | `2` | How long a busy gateway worker waits for more requests to batch (an idle one never waits). |
+| `EMBEDDING_DOCUMENT_CHUNK_TEXTS` | `8` | Texts per model call for documents. Smaller keeps query latency lower while documents are indexed; larger cuts per-call overhead. |
 | `LLAMA_PARALLEL` | `4` | Texts each model server (gemma and qwen) runs at once. |
 | `SERVICE_URL` | `http://localhost:8001` | Service the test and sample-embedding scripts use. |
 
 `start` saves its settings in `embedding_service.env` (gitignored), which
-`stop`, `status`, `logs` and `restart` read. The three tuning variables
-(`EMBEDDING_MAX_BATCH_TEXTS`, `EMBEDDING_BATCH_WAIT_MS`, `LLAMA_PARALLEL`) are
-saved only when set.
+`stop`, `status`, `logs` and `restart` read. The tuning variables
+(`EMBEDDING_MAX_BATCH_TEXTS`, `EMBEDDING_BATCH_WAIT_MS`,
+`EMBEDDING_DOCUMENT_CHUNK_TEXTS`, `LLAMA_PARALLEL`) are saved only when set.
 
 ---
 

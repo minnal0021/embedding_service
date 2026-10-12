@@ -89,6 +89,9 @@ ENVIRONMENT (used when the matching option is not given)
                              batching concurrent requests (default: 256)
   EMBEDDING_BATCH_WAIT_MS    how long a busy gateway waits to fill a batch
                              (default: 2; an idle one never waits)
+  EMBEDDING_DOCUMENT_CHUNK_TEXTS
+                             texts per model call for documents, bounding how
+                             long a query waits behind them (default: 8)
   LLAMA_PARALLEL             sequences each model server (gemma, qwen) runs at
                              once (default: 4)
 
@@ -375,7 +378,7 @@ LOCAL_GID=$(id -g)
 EOF
   # Tuning knobs, kept only when set so the compose defaults apply otherwise.
   local var
-  for var in EMBEDDING_MAX_BATCH_TEXTS EMBEDDING_BATCH_WAIT_MS LLAMA_PARALLEL; do
+  for var in EMBEDDING_MAX_BATCH_TEXTS EMBEDDING_BATCH_WAIT_MS EMBEDDING_DOCUMENT_CHUNK_TEXTS LLAMA_PARALLEL; do
     if [[ -n "${!var:-}" ]]; then
       echo "${var}=${!var}" >>"${STATE_FILE}"
     fi

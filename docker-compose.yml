@@ -13,7 +13,8 @@
 #   EMBEDDING_QWEN_GGUF
 #   LLAMA_BACKEND            backend the overlay provides, for /healthcheck (cpu)
 #   LOCAL_UID, LOCAL_GID     owner for files model-fetch writes to the cache
-#   EMBEDDING_MAX_BATCH_TEXTS, EMBEDDING_BATCH_WAIT_MS
+#   EMBEDDING_MAX_BATCH_TEXTS, EMBEDDING_BATCH_WAIT_MS,
+#   EMBEDDING_DOCUMENT_CHUNK_TEXTS
 #                            gateway cross-request batching (see src/server.py)
 #   LLAMA_PARALLEL           slots per model server (4)
 name: embedding-service
@@ -73,6 +74,7 @@ services:
       LLAMA_BACKEND: ${LLAMA_BACKEND:-cpu}
       EMBEDDING_MAX_BATCH_TEXTS: ${EMBEDDING_MAX_BATCH_TEXTS:-256}
       EMBEDDING_BATCH_WAIT_MS: ${EMBEDDING_BATCH_WAIT_MS:-2}
+      EMBEDDING_DOCUMENT_CHUNK_TEXTS: ${EMBEDDING_DOCUMENT_CHUNK_TEXTS:-8}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthcheck', timeout=5)"]
       interval: 15s
