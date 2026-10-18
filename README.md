@@ -6,14 +6,9 @@ The embedding service turns text into vector embeddings over HTTP. It serves two
 models through [llama.cpp](https://github.com/ggml-org/llama.cpp), run with
 Docker Compose, on an AMD, NVIDIA or Vulkan GPU, or on the CPU.
 
-It has **two parts**:
-
-- **The service.** A small HTTP gateway in front of one llama.cpp model server
-  per model. Callers send a batch of texts and get back one L2-normalised vector
-  per text. See **[Quick start](#quick-start)** and **[HTTP API](#http-api)**.
-- **The offline pipeline.** Two scripts embed a sample QA dataset through the
-  running service and cluster the results into K-means centroids, one set per
-  model. See **[Offline pipeline](#offline-pipeline-sample-embeddings--centroids)**.
+A small HTTP gateway sits in front of one llama.cpp model server per model.
+Callers send a batch of texts and get back one L2-normalised vector per text.
+See **[Quick start](#quick-start)** and **[HTTP API](#http-api)**.
 
 > **Platform support:** Linux and WSL2 with Docker. Docker on macOS has no GPU
 > access, so the service isn't set up for macOS.
@@ -21,8 +16,7 @@ It has **two parts**:
 > **Companion database:** [minnal0021/minnal](https://github.com/minnal0021/minnal)
 > uses this service for semantic search. Point its
 > `semantic_search.embedding_service_url` at the service (default
-> `http://localhost:8001`), set `semantic_search.model` to `gemma` or `qwen`, and
-> use the cluster centroids this pipeline generates for that model.
+> `http://localhost:8001`) and set `semantic_search.model` to `gemma` or `qwen`.
 
 ---
 
@@ -35,11 +29,9 @@ It has **two parts**:
 - [Quick start](#quick-start)
 - [HTTP API](#http-api)
 - [Models](#models)
-- [Offline pipeline: sample embeddings → centroids](#offline-pipeline-sample-embeddings--centroids)
 - [Scripts](#scripts)
 - [Configuration](#configuration)
 - [GPU backends](#gpu-backends)
-- [Sample data & Git LFS](#sample-data--git-lfs)
 - [Project layout](#project-layout)
 - [License](#license)
 
@@ -79,7 +71,6 @@ If you already know these terms, skip ahead to [Architecture](#architecture).
 | **Matryoshka truncation** (MRL) | The models are trained so that the first *N* numbers of a vector are a usable smaller embedding on their own. Truncating to *N* and re-normalising trades a little accuracy for a smaller vector. |
 | **L2 normalisation** | Scaling a vector to length 1, so the dot product of two vectors equals their cosine similarity. |
 | **GGUF / quantisation** | GGUF is llama.cpp's model file format. A *quantised* build stores the weights with fewer bits (e.g. `Q4_K_M` ≈ 4.5 bits, `Q8_0` = 8 bits, `f16` = 16 bits), trading a little accuracy for a smaller download and less GPU memory. |
-| **Cluster centroids** | The centre points of groups of similar vectors, found with K-means. A vector database such as minnal uses them to search only the few groups nearest to a query instead of every vector. |
 
 ---
 
@@ -100,13 +91,6 @@ If you already know these terms, skip ahead to [Architecture](#architecture).
             └───────────┬──────┘   └──────┬───────────┘   -cuda | :server (CPU)
                         └───────┬─────────┘
                     ./model_cache  (GGUFs, fetched by the model-fetch container)
-
-  Offline pipeline, per model (embeds through the running service):
-
-  sample_data/*.jsonl ─► SampleEmbeddingGenerator ─► embedding/<model>/sample_data_embedding.parquet
-                                                          │
-                                                          ▼
-                              ClusterCentroidGenerator ─► embedding/<model>/cluster_centroids.jsonl
 ```
 
 The service runs as four containers:
@@ -151,8 +135,6 @@ between the slots rather than multiplied.
 
 ## Requirements
 
-For the service:
-
 - Linux or WSL2 with **Docker Engine** and the **Compose plugin**
   (`docker compose`).
 - Optionally a GPU; see [GPU backends](#gpu-backends). Without one, the models
@@ -161,12 +143,6 @@ For the service:
 - GPU (or system) memory: about **10.6 GB** with both models at the default
   builds, growing to about 13 GB under load. Gemma alone needs well under 1 GB;
   see [GPU memory](#gpu-memory).
-
-For the offline pipeline:
-
-- Python **≥ 3.14** and [`uv`](https://docs.astral.sh/uv/)
-- The running service, here or on another machine (`SERVICE_URL`)
-- [Git LFS](https://git-lfs.com/) to check out the sample data
 
 ---
 
@@ -327,84 +303,7 @@ lists each build's download size and GPU memory), or name any GGUF file with
 **Keep one index to one model and one build.** Vectors from different models
 live in unrelated vector spaces. Different builds of the same model (e.g. Qwen
 `Q4_K_M` and `Q8_0`) give close but not identical vectors. When you change
-either, re-embed the index and regenerate its centroids.
-
----
-
-## Offline pipeline: sample embeddings → centroids
-
-A two-stage pipeline turns the sample QA dataset into cluster centroids,
-**per model**, since centroids from one model's vector space are meaningless
-for the other. Stage 1 embeds through the running service, so start it first
-with the model loaded; stage 2 only reads the saved embeddings.
-
-```bash
-./embedding_service.sh start             # gemma + qwen (or --models qwen)
-./generate_sample_embeddings.sh qwen     # → embedding/qwen/sample_data_embedding.parquet
-./generate_cluster_centroids.sh qwen     # → embedding/qwen/cluster_centroids.jsonl
-```
-
-Both scripts require the model name (`gemma` or `qwen`) and reject anything else.
-
-### 1. Generate sample embeddings
-
-[`src/sample_embedding_generator.py`](src/sample_embedding_generator.py) reads
-ELI5-style `["question", "answer"]` JSONL records, embeds the combined
-`question + "\n" + answer` text as a document, and writes a Parquet file.
-
-```bash
-uv run python src/sample_embedding_generator.py \
-  --model qwen \
-  --input sample_data/eli5_question_answer.jsonl \
-  --dimensions 768 \
-  --batch-size 32 \
-  --max-records 0          # 0 = all records
-# --output defaults to embedding/<model>/sample_data_embedding.parquet
-```
-
-- `--dimensions` defaults to 768; `0` keeps the model's native width.
-- `--service-url` (or `SERVICE_URL`, default `http://localhost:8001`) points it
-  at the service, which may run on another machine. It checks that the model is
-  loaded and ready before starting.
-- A batch the service rejects is retried one record at a time, and only the
-  failing records are skipped. (Records longer than the model's context are
-  truncated by the service, not rejected.)
-- The shell script reads `DIMENSIONS`, `BATCH_SIZE`, `MAX_RECORDS` (default
-  25000) and `SERVICE_URL` from the environment.
-
-Qwen-8B is much slower than Gemma (~2 QA pairs/s on a Radeon 890M, ~1 s per
-pair on a 22-core CPU), so use a GPU-backed service or a smaller `MAX_RECORDS`
-for it.
-
-Output Parquet schema: `question : string`, `answer : string`,
-`qa_embedding : list[float]`.
-
-### 2. Generate cluster centroids
-
-[`src/cluster_centroid_generator.py`](src/cluster_centroid_generator.py) loads the
-model's Parquet file, runs K-means, and writes the centroids to JSONL.
-
-```bash
-uv run python src/cluster_centroid_generator.py \
-  --model qwen \
-  --dimensions 768 \
-  --n-clusters 256 \
-  --seed 42
-# --input/--output default to embedding/<model>/...; pass them to override
-```
-
-Output JSONL (one object per line):
-
-```json
-{"cluster_id": 1, "centroid": [0.01, -0.02, ...]}
-{"cluster_id": 2, "centroid": [0.03,  0.01, ...]}
-```
-
-- `--dimensions` Matryoshka-truncates and re-normalises the stored vectors
-  before clustering (default 768; `0` = use the stored width as-is).
-- `--n-clusters` defaults to 256 and is capped to the number of embeddings.
-- The shell script reads `DIMENSIONS`, `N_CLUSTERS` and `SEED` from the
-  environment.
+either, re-embed the index.
 
 ---
 
@@ -414,8 +313,6 @@ Output JSONL (one object per line):
 | --- | --- |
 | [`embedding_service.sh start\|stop\|restart\|status\|logs`](embedding_service.sh) | `start`: pick the GPU backend, build the gateway image, fetch the models, start the containers, wait for health, smoke test each model (`-f` stays attached). `stop`: remove the containers. `restart`: both, with the last settings. `status`: containers and loaded models. `logs [service]`: follow the logs. |
 | [`test_embeddings.sh [MODEL]`](test_embeddings.sh) | Test suite per model (query/document embedding, default and truncated dimensions) plus 404 checks. No `MODEL` = every loaded model. |
-| [`generate_sample_embeddings.sh MODEL`](generate_sample_embeddings.sh) | Embed the sample QA data with `MODEL`, through the running service. |
-| [`generate_cluster_centroids.sh MODEL`](generate_cluster_centroids.sh) | Cluster `MODEL`'s sample embeddings into centroids. |
 
 `embedding_service.sh start` options: `--models`, `--qwen-quant`, `--backend`,
 `--host`, `--port`, `--cache-dir`, `--pull`, `-f/--foreground`. Run any script
@@ -425,8 +322,8 @@ with `-h` for details.
 
 ## Configuration
 
-Environment variables, read by the start script, the containers and the
-offline pipeline. Each start option has a matching variable, used when the
+Environment variables, read by the start script, the containers and the test
+script. Each start option has a matching variable, used when the
 option is not given.
 
 | Variable | Default | Description |
@@ -444,7 +341,7 @@ option is not given.
 | `EMBEDDING_BATCH_WAIT_MS` | `2` | How long a busy gateway worker waits for more requests to batch (an idle one never waits). |
 | `EMBEDDING_DOCUMENT_CHUNK_TEXTS` | `8` | Texts per model call for documents. Smaller keeps query latency lower while documents are indexed; larger cuts per-call overhead. |
 | `LLAMA_PARALLEL` | `4` | Texts each model server (gemma and qwen) runs at once. |
-| `SERVICE_URL` | `http://localhost:8001` | Service the test and sample-embedding scripts use. |
+| `SERVICE_URL` | `http://localhost:8001` | Service the test script uses. |
 
 `start` saves its settings in `embedding_service.env` (gitignored), which
 `stop`, `status`, `logs` and `restart` read. The tuning variables
@@ -543,22 +440,6 @@ New-NetFirewallHyperVRule -Name "EmbeddingService8001" `
 
 ---
 
-## Sample data & Git LFS
-
-`sample_data/eli5_question_answer.jsonl` (~166 MB) is tracked with Git LFS (see
-[`.gitattributes`](.gitattributes)). After cloning:
-
-```bash
-git lfs install
-git lfs pull
-```
-
-The model cache (`model_cache/`), generated embeddings (`embedding/`), local
-notes (`docs/`) and the start script's saved settings (`embedding_service.env`)
-are gitignored.
-
----
-
 ## Project layout
 
 ```
@@ -566,24 +447,21 @@ are gitignored.
 ├── src/
 │   ├── models.py                     # MODELS registry (prompts, dims, GGUF builds)
 │   ├── server.py                     # FastAPI gateway → llama-server per model
-│   ├── fetch_models.py               # GGUF download for the containers (model-fetch)
-│   ├── sample_embedding_generator.py # ELI5 QA → Parquet embeddings (per model)
-│   └── cluster_centroid_generator.py # Parquet → K-means centroids (JSONL)
+│   └── fetch_models.py               # GGUF download for the containers (model-fetch)
 ├── docker/
 │   ├── gateway.Dockerfile            # gateway + model-fetch image
 │   └── compose.<backend>.yml         # GPU overlays: rocm-wsl, rocm, cuda, vulkan
-├── sample_data/
-│   └── eli5_question_answer.jsonl    # sample QA pairs (Git LFS)
 ├── docker-compose.yml
 ├── embedding_service.sh              # start | stop | restart | status | logs
 ├── tests/
 │   └── test_truncate.py              # unit tests: python -m unittest discover tests
 ├── test_embeddings.sh
-├── generate_sample_embeddings.sh
-├── generate_cluster_centroids.sh
 ├── pyproject.toml
 └── README.md
 ```
+
+The model cache (`model_cache/`), local notes (`docs/`) and the start script's
+saved settings (`embedding_service.env`) are gitignored.
 
 ---
 

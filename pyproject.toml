@@ -12,15 +12,3 @@ dependencies = [
     "huggingface-hub>=1.21.0",
 ]
 
-[dependency-groups]
-# The offline sample-embedding / centroid pipeline (embeddings come from the
-# running service). Installed by default for local `uv sync` / `uv run`.
-tools = [
-    "pandas",
-    "pyarrow",
-    "tqdm",
-    "scikit-learn",
-]
-
-[tool.uv]
-default-groups = ["tools"]
