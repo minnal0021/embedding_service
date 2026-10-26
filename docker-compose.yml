@@ -33,6 +33,12 @@ x-model-env: &model-env
 # EOS token, so last) and context (gemma's native 2048; qwen supports 32k,
 # capped at 8192 to bound KV-cache and compute memory). llama.cpp needs a whole
 # sequence in one micro-batch to pool it, so -b = -ub = -c.
+#
+# The prompt cache is off (--no-cache-prompt, cache-ram 0). Embedding inputs
+# are never repeated, so it never hits, but llama-server still saved each
+# finished slot to a host-RAM cache (up to 8 GiB) and searched every entry on
+# each new task. That ran on one CPU thread, and as the cache filled,
+# throughput decayed until a restart emptied it.
 x-llama: &llama
   image: ghcr.io/ggml-org/llama.cpp:server
   restart: unless-stopped
@@ -41,6 +47,7 @@ x-llama: &llama
   environment:
     LLAMA_ARG_HOST: 0.0.0.0
     LLAMA_ARG_PORT: "8080"
+    LLAMA_ARG_CACHE_RAM: "0"
   depends_on:
     model-fetch:
       condition: service_completed_successfully
@@ -87,7 +94,7 @@ services:
     command: >-
       -m /models/active/gemma.gguf --embedding --pooling mean
       -c 2048 -b 2048 -ub 2048 -ngl 99
-      -np ${LLAMA_PARALLEL:-4} -kvu
+      -np ${LLAMA_PARALLEL:-4} -kvu --no-cache-prompt
 
   llama-qwen:
     <<: *llama
@@ -95,4 +102,4 @@ services:
     command: >-
       -m /models/active/qwen.gguf --embedding --pooling last
       -c 8192 -b 8192 -ub 8192 -ngl 99
-      -np ${LLAMA_PARALLEL:-4} -kvu
+      -np ${LLAMA_PARALLEL:-4} -kvu --no-cache-prompt
